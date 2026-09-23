@@ -1,1 +1,32 @@
+# Виртуальные окружения
+.venv/
+venv/
+env/
 
+# Кэш байткода Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Установленные пакеты и сборка
+*.egg-info/
+build/
+dist/
+
+# Настройки IDE
+.idea/
+.vscode/
+*.swp
+
+# Юпитер
+.ipynb_checkpoints/
+
+# Логи и результаты работы краулера
+*.log
+data/
+output/
+
+# Системный мусор
+.DS_Store
+Thumbs.db
+desktop.ini
