@@ -1,1 +1,2 @@
-
+aiohttp>=3.9
+aiofiles>=23.2
