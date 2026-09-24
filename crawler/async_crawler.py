@@ -1,10 +1,11 @@
-
 """
-День 1. Базовый асинхронный HTTP-клиент.
+Асинхронный HTTP-клиент.
 
-Здесь только класс AsyncCrawler. Настройка логирования и запуск —
-в demo_day1.py: библиотека пишет в логгер, но не решает за приложение,
-куда и в каком формате его выводить.
+День 1 — загрузка страниц.
+День 2 — плюс метод fetch_and_parse: загрузить и сразу разобрать.
+
+Настройка логирования и запуск — в демо-скриптах: библиотека пишет
+в логгер, но не решает за приложение, куда и в каком формате выводить.
 """
 
 from __future__ import annotations
@@ -13,6 +14,8 @@ import asyncio
 import logging
 
 import aiohttp
+
+from crawler.html_parser import HTMLParser
 
 # Логгер по имени модуля. Сам по себе ничего не печатает, пока
 # приложение не настроит handler'ы — стандартная практика для библиотек.
@@ -36,14 +39,20 @@ class AsyncCrawler:
         connect_timeout: float = 10.0,
         read_timeout: float = 15.0,
         total_timeout: float = 30.0,
+        html_parser: HTMLParser | None = None,
     ) -> None:
         """
         max_concurrent — сколько запросов летит одновременно.
 
         Таймауты вынесены в параметры, чтобы их можно было проверить
-        в демо (пункт 7 задания: «протестировать таймауты»).
+        в демо (день 1, пункт 7: «протестировать таймауты»).
+
+        html_parser — день 2. Свой экземпляр нужен, если хочешь другие
+        настройки разбора (например, оставлять только ссылки своего
+        домена). Не передашь — создастся стандартный.
         """
         self.max_concurrent = max_concurrent
+        self.html_parser = html_parser or HTMLParser()
 
         # ClientTimeout — несколько РАЗНЫХ таймаутов, и это не придирка:
         #   connect   — сколько ждём установления соединения
@@ -199,3 +208,38 @@ class AsyncCrawler:
 
         logger.info("Загружено %d из %d URL", len(pages), len(urls))
         return pages
+
+    # ---------- день 2: загрузка + разбор ----------
+
+    async def fetch_and_parse(self, url: str) -> dict:
+        """
+        Загружает страницу и сразу разбирает её.
+
+        Возвращает словарь с полями url, title, text, links, metadata
+        (плюс images, headings, tables, lists от парсера).
+
+        Если загрузка не удалась, возвращается словарь той же формы,
+        но с пустыми полями и заполненным ключом error. Так вызывающий
+        код всегда получает dict и может работать единообразно,
+        не проверяя результат на None.
+        """
+        html = await self.fetch_url(url)
+
+        if html is None:
+            return {
+                "url": url,
+                "title": "",
+                "text": "",
+                "links": [],
+                "metadata": {},
+                "images": [],
+                "headings": {},
+                "tables": [],
+                "lists": [],
+                "parse_errors": [],
+                "error": self.errors.get(url, "не удалось загрузить"),
+            }
+
+        result = await self.html_parser.parse_html(html, url)
+        result["error"] = None
+        return result
