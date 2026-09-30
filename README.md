@@ -16,12 +16,15 @@
 .
 ├── crawler/              # пакет с кодом краулера, растёт от дня ко дню
 │   ├── __init__.py       # публичный API пакета
-│   ├── async_crawler.py  # загрузка страниц
-│   └── html_parser.py    # разбор HTML
+│   ├── async_crawler.py      # загрузка страниц и обход сайта
+│   ├── html_parser.py        # разбор HTML
+│   ├── crawler_queue.py      # очередь URL с приоритетами
+│   └── semaphore_manager.py  # лимиты: общий и на домен
 ├── demos/                # демонстрации и проверки по дням
 │   ├── __init__.py
 │   ├── demo_day1.py
-│   └── demo_day2.py
+│   ├── demo_day2.py
+│   └── demo_day3.py
 ├── docs/                 # разбор заданий по дням
 │   └── day1.md
 ├── requirements.txt
@@ -54,6 +57,7 @@ pip install -r requirements.txt
 ```bash
 python -m demos.demo_day1
 python -m demos.demo_day2
+python -m demos.demo_day3
 ```
 
 **Почему `-m`, а не `python demos/demo_day1.py`.** Python при запуске
@@ -71,7 +75,7 @@ python -m demos.demo_day2
 |---|---|---|---|
 | 1 | Базовый асинхронный HTTP-клиент | `day1` | готово |
 | 2 | Парсинг HTML и извлечение данных | `day2` | готово |
-| 3 | — | `day3` | — |
+| 3 | Очереди и управление конкурентностью | `day3` | готово |
 | 4 | — | `day4` | — |
 | 5 | — | `day5` | — |
 | 6 | — | `day6` | — |

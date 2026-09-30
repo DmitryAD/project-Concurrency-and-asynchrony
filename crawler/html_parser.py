@@ -222,7 +222,9 @@ class HTMLParser:
         metadata: dict = {"title": "", "description": "", "keywords": ""}
 
         if soup.title and soup.title.string:
-            metadata["title"] = soup.title.string.strip()
+            # split + join схлопывает переносы строк и лишние пробелы
+            # внутри заголовка: "Travel |\n    Books" -> "Travel | Books"
+            metadata["title"] = " ".join(soup.title.string.split())
 
         for name in ("description", "keywords"):
             # attrs={"name": ...} — ищем <meta name="description" content="...">
