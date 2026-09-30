@@ -26,9 +26,14 @@ class SemaphoreManager:
             ...   # здесь запрос
     """
 
-    def __init__(self, max_concurrent: int = 10, max_per_domain: int = 5) -> None:
+    def __init__(self, max_concurrent: int = 10, max_per_domain: int | None = None) -> None:
+        """
+        max_per_domain=None — отдельного лимита на домен нет, действует
+        только общий max_concurrent. Так поведение дней 1-2 не меняется:
+        код, который про домены ничего не знает, работает как раньше.
+        """
         self.max_concurrent = max_concurrent
-        self.max_per_domain = max_per_domain
+        self.max_per_domain = max_concurrent if max_per_domain is None else max_per_domain
 
         # Семафоры создаются лениво: глобальный — при первом запросе,
         # доменные — при первом запросе к каждому новому домену.

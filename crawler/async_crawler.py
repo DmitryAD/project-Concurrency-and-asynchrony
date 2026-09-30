@@ -57,7 +57,7 @@ class AsyncCrawler:
         total_timeout: float = 30.0,
         html_parser: HTMLParser | None = None,
         max_depth: int = 3,
-        max_per_domain: int = 5,
+        max_per_domain: int | None = None,
         progress_interval: float = 1.0,
     ) -> None:
         """
@@ -74,7 +74,9 @@ class AsyncCrawler:
         с неё, 2 — плюс ссылки с тех страниц, и так далее.
 
         max_per_domain — день 3. Сколько запросов одновременно
-        к одному сайту.
+        к одному сайту. None (по умолчанию) — отдельного лимита нет,
+        работает только max_concurrent, как в днях 1-2. Для вежливого
+        обхода чужих сайтов задавай явно, например 3-5.
 
         progress_interval — раз в сколько секунд печатать прогресс.
         """
