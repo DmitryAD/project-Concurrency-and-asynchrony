@@ -13,6 +13,9 @@ __pycache__/
 build/
 dist/
 
+# Точные версии зависимостей — если понадобится, раскомментируй
+# requirements.lock.txt
+
 # Настройки IDE
 .idea/
 .vscode/
@@ -23,6 +26,7 @@ dist/
 
 # Логи и результаты работы краулера
 *.log
+*.log.*
 data/
 output/
 

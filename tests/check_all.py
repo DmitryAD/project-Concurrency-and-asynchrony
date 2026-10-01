@@ -22,6 +22,9 @@ aiohttp. Серверы сами считают:
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import gzip
+import io
 import json
 import logging
 import socket
@@ -37,9 +40,13 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 from crawler import (
-    AsyncCrawler, CircuitBreaker, CrawlerQueue, CSVStorage, HTMLParser, JSONStorage,
-    RetryStrategy, RobotsParser, SQLiteStorage,
+    AdvancedCrawler, AsyncCrawler, CircuitBreaker, ConfigError, CrawlerConfig, CrawlerQueue,
+    CrawlerStats, CSVStorage, HTMLParser, JSONStorage, RetryStrategy, RobotsParser,
+    SitemapParser, SQLiteStorage,
 )
+from crawler.cli import build_parser, config_from_args
+from crawler.logging_setup import remove_logging_handlers, setup_logging
+from crawler.progress import ProgressMonitor, estimate, format_progress
 from crawler.storage import STANDARD_FIELDS
 from crawler.errors import (
     CircuitOpenError, NetworkError, ParseError, PermanentError, RateLimitedError,
@@ -82,6 +89,37 @@ Crawl-delay: 0.3
 User-agent: BlockedBot
 Disallow: /
 """
+
+# День 7: sitemap. {B} заменяется адресом сервера при ответе.
+# Индекс ссылается на обычный sitemap, на сжатый gzip, на вложенный
+# индекс, на несуществующий файл и сам на себя (цикл).
+SITEMAPS = {
+    "/sitemap.xml": ("index", ["/sitemaps/pages.xml", "/sitemaps/more.xml.gz",
+                               "/sitemaps/nested.xml", "/sitemaps/missing.xml", "/sitemap.xml"]),
+    "/sitemaps/pages.xml": ("urlset", ["/site/", "/site/a", "/site/b"]),
+    "/sitemaps/more.xml.gz": ("urlset", ["/site/a/1", "/site/b"]),          # /site/b — дубль
+    "/sitemaps/nested.xml": ("index", ["/sitemaps/deep.xml"]),
+    "/sitemaps/deep.xml": ("urlset", ["/site/x", "relative/page"]),         # относительный адрес
+    "/sitemaps/site.xml": ("urlset", ["/site/", "/site/x"]),                # для AdvancedCrawler
+}
+BROKEN_SITEMAP = "<urlset><url><loc>http://x/</loc></url>"                  # не закрыт
+
+
+def sitemap_xml(kind: str, paths: list[str], base: str) -> str:
+    ns = 'xmlns="http://www.sitemaps.org/schemas/sitemap/0.9"'
+    tag, item = ("sitemapindex", "sitemap") if kind == "index" else ("urlset", "url")
+    entries = "".join(
+        f"<{item}><loc>{p if not p.startswith('/') else base + p}</loc></{item}>" for p in paths
+    )
+    return f'<?xml version="1.0" encoding="UTF-8"?>\n<{tag} {ns}>{entries}</{tag}>'
+
+
+def gen_page(i: int) -> str:
+    """День 7: бесконечное дерево /gen/i → /gen/5i+1 … /gen/5i+5, для проверки масштаба."""
+    links = [f"/gen/{5 * i + k}" for k in range(1, 6)]
+    text = f"<p>Страница номер {i}. " + "Немного текста для разбора. " * 20 + "</p>"
+    return page(f"Gen {i}", *links, extra=text)
+
 
 # Страница для проверки разбора (день 2)
 PARSE_PAGE = (
@@ -164,12 +202,13 @@ class Handler(BaseHTTPRequestHandler):
         except (BrokenPipeError, ConnectionResetError):
             pass   # клиент ушёл раньше — это не ошибка сервера
 
-    def _send(self, code: int, body: str, headers: dict | None = None) -> None:
-        data = body.encode("utf-8")
+    def _send(self, code: int, body: str | bytes, headers: dict | None = None) -> None:
+        data = body if isinstance(body, bytes) else body.encode("utf-8")
+        headers = dict(headers or {})
         self.send_response(code)
-        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Type", headers.pop("Content-Type", "text/html; charset=utf-8"))
         self.send_header("Content-Length", str(len(data)))
-        for name, value in (headers or {}).items():
+        for name, value in headers.items():
             self.send_header(name, value)
         self.end_headers()
         self.wfile.write(data)
@@ -199,7 +238,20 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/parse":
             return 200, PARSE_PAGE
         if path == "/robots.txt":
-            return 200, ROBOTS_TXT
+            # День 7: строка Sitemap — для SitemapParser.discover.
+            # На правила доступа она не влияет.
+            base = f"http://127.0.0.1:{self.server.server_address[1]}"
+            return 200, ROBOTS_TXT + f"\nSitemap: {base}/sitemaps/pages.xml\n"
+        if path in SITEMAPS:
+            base = f"http://127.0.0.1:{self.server.server_address[1]}"
+            xml = sitemap_xml(*SITEMAPS[path], base)
+            if path.endswith(".gz"):
+                return 200, gzip.compress(xml.encode("utf-8")), {"Content-Type": "application/gzip"}
+            return 200, xml, {"Content-Type": "application/xml"}
+        if path == "/sitemaps/broken.xml":
+            return 200, BROKEN_SITEMAP, {"Content-Type": "application/xml"}
+        if path.startswith("/gen/"):
+            return 200, gen_page(int(path.rsplit("/", 1)[1]))
         if path in SITE and path != "/site/c":
             links = [self.external if link == "EXTERNAL" else link for link in SITE[path]]
             return 200, page(path, *links)
@@ -1084,6 +1136,371 @@ async def _(B, B2):
         await c.close()
     assert len(res) == 9, f"обработано {len(res)} страниц, ожидали 9"
     assert st.failed == 9 and st.saved == 0, st.get_stats()
+
+
+# ---------- День 7 ----------
+
+def site_urls(B: str, *paths: str) -> set[str]:
+    return {B + p for p in paths}
+
+
+def sitemap_hits(B: str) -> dict:
+    port = port_of(B)
+    return {p: n for (pt, p), n in STATS.hits.items()
+            if pt == port and (p.startswith("/sitemap") or p == "/robots.txt")}
+
+
+@check("День 7", "sitemap: обычный urlset — все адреса по порядку")
+async def _(B, B2):
+    c = AsyncCrawler()
+    try:
+        urls = await SitemapParser(fetcher=c.fetch_bytes).fetch_sitemap(f"{B}/sitemaps/pages.xml")
+    finally:
+        await c.close()
+    assert urls == [f"{B}/site/", f"{B}/site/a", f"{B}/site/b"], urls
+
+
+@check("День 7", "sitemap index: рекурсия, gzip, вложенный индекс, без дублей и циклов")
+async def _(B, B2):
+    STATS.reset()
+    c = AsyncCrawler()
+    sp = SitemapParser(fetcher=c.fetch_bytes)
+    try:
+        urls = await sp.fetch_sitemap(f"{B}/sitemap.xml")
+    finally:
+        await c.close()
+    expected = site_urls(B, "/site/", "/site/a", "/site/b", "/site/a/1", "/site/x",
+                         "/sitemaps/relative/page")
+    assert set(urls) == expected, f"лишнее {set(urls) - expected}, не хватает {expected - set(urls)}"
+    assert len(urls) == len(set(urls)), f"есть дубли: {urls}"
+    hits = sitemap_hits(B)
+    assert all(n == 1 for n in hits.values()), f"какой-то файл скачан дважды (цикл?): {hits}"
+    assert hits.get("/sitemaps/more.xml.gz") == 1, "сжатый sitemap не скачивался"
+    assert f"{B}/sitemaps/missing.xml" in sp.errors, f"404 не записан в errors: {sp.errors}"
+
+
+@check("День 7", "sitemap: битый XML, 404 и недоступный сервер — пустой список, без исключения")
+async def _(B, B2):
+    c = AsyncCrawler(total_timeout=2)
+    sp = SitemapParser(fetcher=c.fetch_bytes)
+    dead = f"http://127.0.0.1:{closed_port()}/sitemap.xml"
+    try:
+        r1 = await sp.fetch_sitemap(f"{B}/sitemaps/broken.xml")
+        r2 = await sp.fetch_sitemap(f"{B}/sitemaps/nothing.xml")
+        r3 = await sp.fetch_sitemap(dead)
+    finally:
+        await c.close()
+    assert r1 == r2 == r3 == [], (r1, r2, r3)
+    assert "не разобрался" in sp.errors[f"{B}/sitemaps/broken.xml"], sp.errors
+    assert sp.errors[f"{B}/sitemaps/nothing.xml"] == "HTTP 404", sp.errors
+    assert dead in sp.errors, sp.errors
+
+
+@check("День 7", "sitemap: адрес находится через строку Sitemap в robots.txt")
+async def _(B, B2):
+    c = AsyncCrawler()
+    try:
+        found = await SitemapParser(fetcher=c.fetch_bytes).discover(f"{B}/site/")
+    finally:
+        await c.close()
+    assert found == [f"{B}/sitemaps/pages.xml"], f"ожидали адрес из robots.txt: {found}"
+
+
+class FakeClock:
+    """Время, которое двигаем руками: скорость считается на точных числах."""
+
+    def __init__(self) -> None:
+        self.now = 100.0
+
+    def __call__(self) -> float:
+        return self.now
+
+
+def filled_stats() -> CrawlerStats:
+    clock = FakeClock()
+    st = CrawlerStats(top_n=2, clock=clock)
+    st.start()
+    pages = [  # (через сколько секунд, url, код, ошибка, тип ошибки)
+        (0.5, "https://b.test/1", 200, None, None),
+        (0.7, "https://a.test/2", 200, None, None),
+        (1.2, "https://a.test/4", 404, "HTTP 404", "PermanentError"),
+        (2.5, "https://a.test/3", 200, None, None),
+        (3.1, "https://c.test/1", None, "TimeoutError", "TransientError"),
+        (3.9, "https://b.test/2", 200, None, None),
+    ]
+    for t, url, code, err, kind in pages:
+        clock.now = 100.0 + t
+        st.record_page({"url": url, "status_code": code, "error": err, "text": "abcd", "depth": 1},
+                       error_type=kind)
+    clock.now = 104.0
+    st.finish()
+    return st
+
+
+@check("День 7", "CrawlerStats: страницы, коды, топ доменов, скорость и время")
+async def _(B, B2):
+    s = filled_stats().get_stats()
+    assert (s["total_pages"], s["successful"], s["failed"]) == (6, 4, 2), s
+    assert s["duration_seconds"] == 4.0 and s["pages_per_second"] == 1.5, s
+    assert s["status_codes"] == {"200": 4, "404": 1, "нет ответа": 1}, s["status_codes"]
+    assert s["top_domains"] == [{"domain": "a.test", "pages": 3}, {"domain": "b.test", "pages": 2}], \
+        s["top_domains"]
+    assert s["errors_by_type"] == {"PermanentError": 1, "TransientError": 1}, s["errors_by_type"]
+    assert s["timeline"]["pages"] == [2, 1, 1, 2] and s["timeline"]["failed"] == [0, 1, 0, 1], \
+        s["timeline"]
+    assert s["success_rate"] == 66.7, s["success_rate"]
+
+
+@check("День 7", "экспорт: JSON читается, HTML самодостаточен и экранирует данные")
+async def _(B, B2):
+    st = filled_stats()
+    evil = '<script>alert("x")</script>'
+    st.record_page({"url": "https://evil.test/p", "status_code": 500, "error": "HTTP 500"},
+                   error_type=evil)
+    d = tmpdir()
+    st.export_to_json(d / "s.json", extra={"note": "проверка"})
+    data = json.loads((d / "s.json").read_text(encoding="utf-8"))
+    assert data["total_pages"] == 7 and data["note"] == "проверка", data
+
+    st.export_to_html_report(d / "r.html")
+    page_html = (d / "r.html").read_text(encoding="utf-8")
+    assert evil not in page_html, "данные из сети попали в HTML без экранирования"
+    assert "&lt;script&gt;" in page_html, "экранированного текста ошибки нет в отчёте"
+    assert "<svg" in page_html and "<table" in page_html, "нет графика или таблицы"
+    for needle in ("a.test", "404", "TransientError"):
+        assert needle in page_html, f"в отчёте нет «{needle}»"
+    assert 'src="http' not in page_html and "<link" not in page_html, "отчёт тянет внешние файлы"
+
+
+@check("День 7", "конфигурация: YAML = JSON, опечатка и неверный тип — понятная ошибка")
+async def _(B, B2):
+    d = tmpdir()
+    data = {"start_urls": ["https://a.test/"], "limits": {"max_pages": 7},
+            "crawler": {"max_concurrent": 3, "rate_limit": 2.5, "respect_robots": True},
+            "storage": {"type": "csv", "path": "out.csv"}}
+    (d / "c.json").write_text(json.dumps(data), encoding="utf-8")
+    (d / "c.yaml").write_text(
+        "start_urls:\n  - https://a.test/\nlimits:\n  max_pages: 7\n"
+        "crawler:\n  max_concurrent: 3\n  rate_limit: 2.5\n  respect_robots: true\n"
+        "storage:\n  type: csv\n  path: out.csv\n", encoding="utf-8")
+    from_json, from_yaml = CrawlerConfig.from_file(d / "c.json"), CrawlerConfig.from_file(d / "c.yaml")
+    assert from_json == from_yaml, "YAML и JSON с одинаковыми настройками дали разное"
+    assert from_yaml.crawler.max_concurrent == 3 and from_yaml.limits.max_depth == 2, \
+        "не применились настройки или значения по умолчанию"
+
+    bad = [({"crawler": {"max_concurent": 3}}, "max_concurrent"),        # опечатка → подсказка
+           ({"limits": {"max_pages": "много"}}, "limits.max_pages"),      # не число
+           ({"storage": {"type": "xml", "path": "a"}}, "storage.type")]   # нет такого формата
+    for cfg, must_mention in bad:
+        try:
+            CrawlerConfig.from_dict(cfg)
+        except ConfigError as e:
+            assert must_mention in str(e), f"в ошибке нет «{must_mention}»: {e}"
+        else:
+            raise AssertionError(f"конфигурация {cfg} принята, а должна быть ошибка")
+
+
+@check("День 7", "CLI: параметры командной строки перекрывают файл конфигурации")
+async def _(B, B2):
+    d = tmpdir()
+    (d / "c.yaml").write_text(
+        "start_urls: [https://a.test/]\nlimits: {max_pages: 50, max_depth: 4}\n"
+        "crawler: {respect_robots: true, rate_limit: 1}\n", encoding="utf-8")
+    args = build_parser().parse_args([
+        "--config", str(d / "c.yaml"), "--max-pages", "5", "--no-respect-robots",
+        "--rate-limit", "3", "--output", str(d / "r.db"),
+    ])
+    cfg = config_from_args(args)
+    assert cfg.limits.max_pages == 5, "--max-pages не перекрыл файл"
+    assert cfg.limits.max_depth == 4, "то, что не задано в командной строке, должно остаться из файла"
+    assert cfg.crawler.respect_robots is False and cfg.crawler.rate_limit == 3.0, cfg.crawler
+    assert (cfg.storage.type, cfg.storage.path) == ("sqlite", str(d / "r.db")), cfg.storage
+
+
+@check("День 7", "CLI: python -m crawler — обход, файл результатов, отчёт, статистика")
+async def _(B, B2):
+    d = tmpdir()
+    root = Path(__file__).resolve().parents[1]
+    proc = await asyncio.create_subprocess_exec(
+        sys.executable, "-m", "crawler", "--urls", f"{B}/site/", "--max-pages", "20",
+        "--max-depth", "5", "--output", str(d / "pages.json"), "--report", str(d / "r.html"),
+        "--stats-json", str(d / "s.json"), "--log-file", str(d / "c.log"), "--no-progress",
+        "--respect-robots",
+        cwd=root, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+    )
+    out, err = await asyncio.wait_for(proc.communicate(), timeout=60)
+    assert proc.returncode == 0, f"код выхода {proc.returncode}\n{err.decode()[-800:]}"
+    summary = json.loads(out.decode().split("\n}", 1)[0] + "\n}")
+    # /site/private запрещён robots.txt, /site/c — 404
+    got = (summary["successful"], summary["failed"], summary["blocked_by_robots"])
+    assert got == (8, 1, 1), summary
+    pages = json.loads((d / "pages.json").read_text(encoding="utf-8"))
+    assert len(pages) == 8, f"в pages.json {len(pages)} записей, ожидали 8"
+    assert json.loads((d / "s.json").read_text(encoding="utf-8"))["total_pages"] == 9
+    assert "<svg" in (d / "r.html").read_text(encoding="utf-8")
+    assert "Готово" in (d / "c.log").read_text(encoding="utf-8"), "в логе нет итоговой строки"
+
+
+@contextlib.contextmanager
+def isolated_logging():
+    """setup_logging меняет корневой логгер — после проверки вернуть как было."""
+    root = logging.getLogger()
+    level, others = root.level, list(root.handlers)
+    for h in others:                 # чужие обработчики (basicConfig в main) — на время убрать
+        root.removeHandler(h)
+    try:
+        yield
+    finally:
+        remove_logging_handlers()
+        for h in others:
+            root.addHandler(h)
+        root.setLevel(level)
+
+
+@check("День 7", "логирование: файл подробнее консоли, ротация, формат JSON")
+async def _(B, B2):
+    d = tmpdir()
+    console = io.StringIO()
+    with isolated_logging(), contextlib.redirect_stderr(console):
+        setup_logging(level="DEBUG", console_level="ERROR", log_file=d / "c.log",
+                      max_bytes=2000, backup_count=2)
+        log = logging.getLogger("crawler.check")
+        for i in range(100):
+            log.debug("подробность %d", i)
+        log.error("что-то сломалось")
+    files = sorted(p.name for p in d.iterdir())
+    assert files == ["c.log", "c.log.1", "c.log.2"], f"ротация: {files}"
+    assert all(p.stat().st_size <= 2200 for p in d.iterdir()), "файл перерос max_bytes"
+    text = console.getvalue()
+    assert "что-то сломалось" in text and "подробность" not in text, f"консоль: {text[:300]}"
+    assert "| DEBUG   |" in (d / "c.log.1").read_text(encoding="utf-8"), "в файле нет DEBUG"
+
+    with isolated_logging(), contextlib.redirect_stderr(io.StringIO()):
+        setup_logging(level="INFO", log_file=d / "j.log", fmt="json")
+        logging.getLogger("crawler.check").info("строка %s", "один")
+    entry = json.loads((d / "j.log").read_text(encoding="utf-8").splitlines()[0])
+    assert entry["message"] == "строка один" and entry["level"] == "INFO", entry
+    datetime.fromisoformat(entry["time"])
+
+
+@check("День 7", "прогресс: процент, скорость, оставшееся время, активные задачи")
+async def _(B, B2):
+    snap = {"done": 30, "successful": 28, "failed": 2, "queued": 50, "in_progress": 5,
+            "elapsed": 10.0, "started": 35, "active_requests": 4, "blocked": 0}
+    e = estimate(snap, max_pages=60)
+    assert e["total"] == 60 and e["percent"] == 50.0, e        # меньше из лимита и известной работы
+    assert e["speed"] == 3.0 and e["eta"] == 10.0, e
+    e2 = estimate({**snap, "queued": 0, "in_progress": 0}, max_pages=60)
+    assert e2["total"] == 30 and e2["percent"] == 100.0, e2     # сайт кончился раньше лимита
+    line = format_progress(snap, max_pages=60)
+    for part in ("50%", "30/60", "3.0 стр/с", "~0:10", "в работе 5", "ошибок 2"):
+        assert part in line, f"в строке нет «{part}»: {line}"
+
+    out = io.StringIO()
+    c = AsyncCrawler(max_concurrent=5, max_depth=5)
+    mon = ProgressMonitor(c.snapshot, max_pages=100, interval=0.02, stream=out)
+    try:
+        mon.start()
+        await c.crawl([f"{B}/delay/0.3"] + [f"{B}/site/"], same_domain_only=True)
+        await mon.stop()
+    finally:
+        await c.close()
+    lines = out.getvalue().splitlines()
+    assert mon.lines_written >= 2, f"строк прогресса: {mon.lines_written}"
+    assert "100%" in lines[-1] and "11/11" in lines[-1], f"последняя строка: {lines[-1]}"
+
+
+@check("День 7", "AsyncCrawler: fetch_bytes, on_page_done и snapshot, сбой крючка не ломает обход")
+async def _(B, B2):
+    seen = []
+
+    def hook(data):
+        seen.append((data["url"], data["error"] is None, data["depth"]))
+        raise RuntimeError("ошибка в чужом коде")
+
+    c = AsyncCrawler(max_depth=5, on_page_done=hook)
+    try:
+        status, body = await c.fetch_bytes(f"{B}/sitemaps/more.xml.gz")
+        missing, _ = await c.fetch_bytes(f"{B}/nothing")
+        res = await c.crawl([f"{B}/site/"], same_domain_only=True)
+    finally:
+        await c.close()
+    assert status == 200 and body[:2] == b"\x1f\x8b", "gzip должен прийти байтами как есть"
+    assert missing == 404, missing
+    assert len(res) == 9 and len(seen) == 10, f"страниц {len(res)}, вызовов крючка {len(seen)}"
+    assert (f"{B}/site/c", False, 1) in seen, "о неудачной странице крючок тоже должен узнать"
+    snap = c.snapshot()
+    assert (snap["done"], snap["successful"], snap["failed"], snap["in_progress"]) == (10, 9, 1, 0), snap
+
+
+def write_yaml_config(d: Path, B: str, **extra_sections: str) -> Path:
+    text = (f"start_urls: ['{B}/site/']\n"
+            f"sitemaps: ['{B}/sitemaps/site.xml']\n"
+            "limits: {max_pages: 50, max_depth: 5}\n"
+            "filters: {same_domain_only: true}\n"
+            "crawler: {max_concurrent: 4}\n"
+            f"storage: {{type: jsonl, path: '{d / 'pages.jsonl'}', batch_size: 3}}\n"
+            "progress: {enabled: false}\n"
+            f"output: {{html_report: '{d / 'auto.html'}'}}\n")
+    for name, body in extra_sections.items():
+        text += f"{name}: {body}\n"
+    path = d / "config.yaml"
+    path.write_text(text, encoding="utf-8")
+    return path
+
+
+@check("День 7", "AdvancedCrawler.from_config: sitemap + обход + хранилище + статистика + отчёт")
+async def _(B, B2):
+    d = tmpdir()
+    (d / "pages.jsonl").write_text('{"url": "старая запись"}\n', encoding="utf-8")
+    cfg = write_yaml_config(d, B, logging=f"{{file: '{d / 'c.log'}', console_level: CRITICAL}}")
+    with isolated_logging():
+        crawler = AdvancedCrawler.from_config(cfg)
+        try:
+            await crawler.crawl()
+            stats = crawler.get_stats()
+            crawler.export_to_html_report(d / "report.html")
+        finally:
+            await crawler.close()
+
+    # /site/x есть только в sitemap: по ссылкам с /site/ до него не дойти
+    assert crawler.sitemap_urls == [f"{B}/site/", f"{B}/site/x"], crawler.sitemap_urls
+    assert (stats["total_pages"], stats["successful"], stats["failed"]) == (11, 10, 1), \
+        {k: stats[k] for k in ("total_pages", "successful", "failed")}
+    assert stats["status_codes"] == {"200": 10, "404": 1}, stats["status_codes"]
+    assert stats["components"]["storage"]["saved"] == 10, stats["components"]["storage"]
+    saved = (d / "pages.jsonl").read_text(encoding="utf-8").splitlines()
+    assert len(saved) == 10 and "старая запись" not in saved[0], "файл не начат заново или не дописан"
+    assert stats["failed_urls_detail"][f"{B}/site/c"]["type"] == "PermanentError"
+    assert stats["errors_by_type"] == {"PermanentError": 1}, stats["errors_by_type"]
+    assert stats["finished_at"] is not None, "время окончания не записано"
+    assert (d / "report.html").exists() and (d / "auto.html").exists(), "отчёт не создан"
+    assert "Готово: 11 страниц" in (d / "c.log").read_text(encoding="utf-8"), "нет записи в логе"
+
+
+@check("День 7", "масштаб: 500 страниц — без дублей, лимиты соблюдены, статистика сходится")
+async def _(B, B2):
+    STATS.reset()
+    config = CrawlerConfig.from_dict({
+        "start_urls": [f"{B}/gen/0"],
+        "limits": {"max_pages": 500, "max_depth": 10},
+        "crawler": {"max_concurrent": 20},
+        "progress": {"enabled": False},
+    })
+    crawler = AdvancedCrawler(config, configure_logging=False)
+    t = time.perf_counter()
+    try:
+        res = await crawler.crawl()
+    finally:
+        await crawler.close()
+    dt = time.perf_counter() - t
+    gen_hits = [n for (pt, p), n in STATS.hits.items() if pt == port_of(B) and p.startswith("/gen/")]
+    stats = crawler.get_stats()
+    assert len(res) == 500 and len(gen_hits) == 500, f"страниц {len(res)}, запросов {len(gen_hits)}"
+    assert max(gen_hits) == 1, "какая-то страница запрошена дважды"
+    assert STATS.peak[port_of(B)] <= 20, f"пик {STATS.peak[port_of(B)]} при лимите 20"
+    assert sum(stats["timeline"]["pages"]) == 500, "столбики графика не сходятся с итогом"
+    assert dt < 30, f"500 страниц за {dt:.1f} c — подозрительно медленно"
 
 
 # ============================================================

@@ -1,0 +1,78 @@
+# Конфигурация краулера (день 7).
+#
+# Запуск:
+#   python -m demos.demo_day7                    — пример из задания
+#   python -m crawler --config config.yaml       — то же из командной строки
+#   python -m crawler --config config.yaml --max-pages 10   — с поправкой на лету
+#
+# Любую настройку можно удалить — возьмётся значение по умолчанию.
+# Опечатка в имени настройки — ошибка с подсказкой, а не тихий пропуск.
+
+# Откуда начинать обход
+start_urls:
+  - https://books.toscrape.com/
+
+# Адреса sitemap.xml: страницы из них добавятся к стартовым.
+sitemaps: []
+# true — поискать sitemap самому: строки Sitemap в robots.txt стартовых
+# сайтов, а если их нет — /sitemap.xml. У books.toscrape.com sitemap нет,
+# поэтому выключено (иначе в консоли будет предупреждение о 404).
+use_sitemap: false
+
+limits:
+  max_pages: 60        # сколько страниц обработать максимум
+  max_depth: 2         # 0 — только стартовые, 1 — плюс ссылки с них, ...
+
+filters:
+  same_domain_only: true      # не уходить на чужие сайты
+  include_patterns: []        # регулярные выражения: если заданы — только совпавшие адреса
+  exclude_patterns:           # регулярные выражения: совпавшие адреса пропускаются
+    - "\\.(jpg|jpeg|png|gif|pdf|zip)$"
+
+crawler:
+  max_concurrent: 5           # одновременных запросов всего
+  max_per_domain: 3           # одновременных запросов к одному сайту
+  rate_limit: 3               # запросов в секунду (null — без ограничения)
+  rate_per_domain: true       # лимит у каждого домена свой
+  min_delay: 0                # минимальная пауза между запросами, c
+  jitter: 0.1                 # случайная добавка к паузе, 0..jitter c
+  error_backoff: 0.5          # замедление после 429/5xx/таймаутов
+  respect_robots: true        # соблюдать robots.txt
+  user_agent: "MyBot/1.0 (educational project; +https://github.com/DmitryAD/project-Concurrency-and-asynchrony)"
+  connect_timeout: 10
+  read_timeout: 15
+  total_timeout: 30
+
+retry:                        # повторы при временных ошибках (день 5)
+  enabled: true
+  max_retries: 3
+  backoff_factor: 2.0
+  base_delay: 0.5
+  max_delay: 30
+
+circuit_breaker:              # временная блокировка «лежащего» домена (день 5)
+  enabled: true
+  failure_threshold: 5
+  recovery_timeout: 30
+
+storage:                      # куда сохранять страницы (день 6)
+  type: sqlite                # none | json | jsonl | csv | sqlite
+  path: output/day7/pages.db
+  batch_size: 20
+  overwrite: true             # каждый запуск — с чистого листа
+
+logging:
+  level: DEBUG                # что пишется в файл
+  console_level: WARNING      # что видно в консоли (не мешает прогресс-бару)
+  file: output/day7/crawler.log
+  max_bytes: 1000000          # ~1 МБ, потом ротация: crawler.log.1, .2, ...
+  backup_count: 3
+  format: text                # text | json
+
+output:                       # отчёты сразу после обхода (можно оставить null)
+  html_report: null
+  stats_json: output/day7/stats.json
+
+progress:
+  enabled: true
+  interval: 0.5

@@ -12,6 +12,12 @@
 День 6 — сохранение результатов в JSON, CSV или SQLite (параметр storage).
          Тоже выключено по умолчанию: без retry_strategy каждый URL
          запрашивается ровно один раз, как в днях 1-4.
+День 7 — три небольших дополнения для AdvancedCrawler, поведение
+         дней 1-6 они не меняют:
+           fetch_bytes  — скачать файл как байты (sitemap.xml.gz);
+           on_page_done — «крючок»: вызывается после каждой страницы,
+                          так считается статистика;
+           snapshot()   — состояние обхода прямо сейчас, для прогресс-бара.
 
 Настройка логирования и запуск — в демо-скриптах: библиотека пишет
 в логгер, но не решает за приложение, куда и в каком формате выводить.
@@ -25,6 +31,7 @@ import logging
 import re
 import time
 from collections import Counter
+from typing import Callable
 from urllib.parse import urlparse
 
 import aiohttp
@@ -104,6 +111,7 @@ class AsyncCrawler:
         retry_strategy: RetryStrategy | None = None,
         circuit_breaker: CircuitBreaker | None = None,
         storage: DataStorage | None = None,
+        on_page_done: Callable[[dict], None] | None = None,
     ) -> None:
         """
         max_concurrent — сколько запросов летит одновременно всего.
@@ -153,6 +161,11 @@ class AsyncCrawler:
 
         circuit_breaker — автомат, временно блокирующий домен, который
             подряд отвечает ошибками. None — без автомата.
+
+        on_page_done — день 7. Функция, которую crawl() вызывает после
+            каждой обработанной страницы (и удачной, и нет) с её данными.
+            None — ничего не вызывается. Ошибка внутри функции обход
+            не останавливает, только пишется в лог.
         """
         self.max_concurrent = max_concurrent
         self.max_depth = max_depth
@@ -215,6 +228,12 @@ class AsyncCrawler:
         # День 6: сохранение и сведения об ответах.
         self.storage = storage
         self.response_info: dict[str, dict] = {}     # url -> код ответа и тип содержимого
+
+        # День 7: крючок для статистики и состояние текущего обхода.
+        self.on_page_done = on_page_done
+        self._queue: CrawlerQueue | None = None
+        self._crawl_started: float | None = None
+        self._pages_started: int = 0
 
     # ---------- сессия ----------
 
@@ -381,6 +400,27 @@ class AsyncCrawler:
             self.circuit_breaker.record_success(domain)
         logger.info("Успешно %s — статус %d, %d символов", url, response.status, len(html))
         return html
+
+    async def fetch_bytes(self, url: str) -> tuple[int, bytes]:
+        """
+        День 7. Скачивает адрес как сырые байты и возвращает (код, тело).
+
+        Нужен для sitemap: файл бывает сжат gzip (sitemap.xml.gz),
+        а text() попытался бы прочитать сжатые байты как текст.
+
+        Идёт через те же лимиты, что и обычные страницы: семафоры,
+        лимит скорости, User-Agent. Код 4xx/5xx — НЕ исключение:
+        решать, что с ним делать, будет вызывающий. Сетевые ошибки
+        и таймауты пробрасываются как есть.
+        """
+        session = self._ensure_session()
+        domain = urlparse(url).netloc.lower()
+        async with self.semaphores.acquire(url):
+            await self.rate_limiter.acquire(domain)
+            ua = self._next_user_agent()
+            headers = {"User-Agent": ua} if ua else None
+            async with session.get(url, headers=headers) as response:
+                return response.status, await response.read()
 
     def _domain_failed(self, domain: str) -> None:
         """Сервер не в порядке: сообщить лимитеру (день 4) и автомату (день 5)."""
@@ -640,6 +680,7 @@ class AsyncCrawler:
                     queue.mark_skipped(url)
                     continue
                 pages_started += 1
+                self._pages_started = pages_started
 
                 depth = queue.get_depth(url)
                 self.visited_urls.add(url)
@@ -649,13 +690,14 @@ class AsyncCrawler:
                 # без отметки queue.join() ждал бы вечно.
                 try:
                     data = await self.fetch_and_parse(url)
+                    data["depth"] = depth
+                    self._page_done(data)
 
                     if data["error"]:
                         self.failed_urls[url] = data["error"]
                         queue.mark_failed(url, data["error"])
                         continue
 
-                    data["depth"] = depth
                     self.processed_urls[url] = data
 
                     # Новые ссылки добавляются ДО отметки о завершении.
@@ -682,6 +724,8 @@ class AsyncCrawler:
                     queue.mark_failed(url, str(e))
 
         started = time.perf_counter()
+        # День 7: чтобы snapshot() мог заглянуть в идущий обход
+        self._queue, self._crawl_started, self._pages_started = queue, started, 0
         workers = [asyncio.create_task(worker()) for _ in range(self.max_concurrent)]
         reporter = asyncio.create_task(self._report_progress(queue, started))
 
@@ -700,6 +744,40 @@ class AsyncCrawler:
             self._log_progress(queue, started, final=True)
 
         return self.processed_urls
+
+    # ---------- день 7: крючок и снимок состояния ----------
+
+    def _page_done(self, data: dict) -> None:
+        """Вызывает on_page_done, не давая его ошибке сломать обход."""
+        if self.on_page_done is None:
+            return
+        try:
+            self.on_page_done(data)
+        except Exception:  # noqa: BLE001
+            logger.exception("Ошибка в on_page_done на %s", data.get("url"))
+
+    def snapshot(self) -> dict:
+        """
+        Состояние обхода прямо сейчас — для прогресс-бара (день 7).
+
+        Ничего не меняет и не ждёт, поэтому его можно вызывать
+        из фоновой задачи сколько угодно часто.
+        """
+        q = self._queue.get_stats() if self._queue is not None else {}
+        done = q.get("processed", 0) + q.get("failed", 0)
+        elapsed = (time.perf_counter() - self._crawl_started
+                   if self._crawl_started is not None else 0.0)
+        return {
+            "done": done,
+            "successful": q.get("processed", 0),
+            "failed": q.get("failed", 0),
+            "queued": q.get("queued", 0),
+            "started": self._pages_started,
+            "in_progress": max(self._pages_started - done, 0),
+            "active_requests": self.semaphores.get_stats()["active_total"],
+            "blocked": len(self.blocked_urls),
+            "elapsed": elapsed,
+        }
 
     # ---------- день 3: прогресс ----------
 
