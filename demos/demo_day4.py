@@ -244,14 +244,35 @@ async def demo_live() -> None:
     print(f"  Запрещено robots   : {stats['blocked_by_robots']}")
 
     header("6б. robots.txt настоящей Википедии")
-    robots = RobotsParser()
-    info = await robots.fetch_robots("https://en.wikipedia.org/")
-    print(f"\n  Ответ: HTTP {info['status']}, режим: {info['mode']}")
-    if info["mode"] == "rules":
+
+    # Википедия требует, чтобы робот честно представлялся и оставлял
+    # способ связи. Безымянные запросы она отклоняет с кодом 403.
+    ua = ("MyBot/1.0 (educational project; "
+          "+https://github.com/DmitryAD/project-Concurrency-and-asynchrony)")
+    crawler = AsyncCrawler(user_agent=ua)
+    try:
+        info = await crawler.robots.fetch_robots("https://en.wikipedia.org/")
+    finally:
+        await crawler.close()
+
+    print(f"\n  User-Agent : {ua}")
+    print(f"  Ответ      : HTTP {info['status']}, режим разбора: {info['mode']}")
+
+    if info["status"] in (401, 403):
+        print("\n    Сайт отказал в доступе даже к robots.txt.")
+        print("    По стандарту ответ 4xx означает «правил нет, можно всё»,")
+        print("    но 401/403 на деле значат «тебя сюда не пускают».")
+        print("    Обходить такой сайт не стоит, даже если формально можно.")
+    elif info["mode"] == "rules":
+        print()
         for path in ("/wiki/Python_(programming_language)", "/wiki/Special:Random", "/w/index.php"):
-            ok = robots.can_fetch(f"https://en.wikipedia.org{path}", "MyBot/1.0")
+            ok = crawler.robots.can_fetch(f"https://en.wikipedia.org{path}", ua)
             print(f"    {path:<40} {'можно' if ok else 'НЕЛЬЗЯ'}")
-    print("\n    Итог зависит от того, что сейчас написано у самой Википедии.")
+        delay = crawler.robots.get_crawl_delay(ua, "https://en.wikipedia.org/")
+        print(f"\n    Crawl-delay для нас: {delay or 'не задан'}")
+        print("    Итог зависит от того, что сейчас написано у самой Википедии.")
+    else:
+        print(f"\n    Правил нет или сайт недоступен (режим {info['mode']}).")
 
 
 async def main() -> None:

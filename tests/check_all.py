@@ -31,7 +31,13 @@ import traceback
 from collections import Counter, defaultdict
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-from crawler import AsyncCrawler, CrawlerQueue, HTMLParser, RobotsParser
+from crawler import (
+    AsyncCrawler, CircuitBreaker, CrawlerQueue, HTMLParser, RetryStrategy, RobotsParser,
+)
+from crawler.errors import (
+    CircuitOpenError, NetworkError, ParseError, PermanentError, RateLimitedError,
+    TransientError, classify_exception, classify_status,
+)
 
 
 # ============================================================
@@ -95,6 +101,7 @@ class Stats:
         self.hits = Counter()                # (порт, путь) -> сколько раз
         self.starts = defaultdict(list)      # порт -> [(время начала, путь)]
         self.user_agents = []                # заголовки User-Agent по порядку
+        self.flaky = Counter()               # ключ капризного адреса -> сколько раз запросили
 
 
 STATS = Stats()
@@ -110,10 +117,13 @@ class Handler(BaseHTTPRequestHandler):
         port = self.server.server_address[1]
         path = self.path.split("?", 1)[0]    # хвост ?n=1 не нужен для маршрута
 
-        # /hang/N — для проверки таймаута. Клиент бросает такой запрос,
-        # а сервер ещё несколько секунд «досыпает». Чтобы этот хвост не
-        # испортил подсчёт в следующих проверках, его не считаем вовсе.
-        if path.startswith("/hang/"):
+        # /hang/N и /slowhang/N — для проверок таймаута. Клиент может
+        # бросить такой запрос, а сервер ещё досыпает. Чтобы этот хвост
+        # не испортил подсчёт пиков в следующих проверках, в «активные»
+        # такие запросы не попадают. Число обращений при этом считаем.
+        if path.startswith(("/hang/", "/slowhang/")):
+            with STATS.lock:
+                STATS.hits[(port, path)] += 1
             try:
                 time.sleep(float(path.rsplit("/", 1)[1]))
                 self._send(200, page("Долго"))
@@ -135,29 +145,44 @@ class Handler(BaseHTTPRequestHandler):
         # успеет обнулить статистику, а наше уменьшение счётчика прилетит
         # уже после — и испортит подсчёт пика в чужой проверке.
         try:
-            code, body = self._route(path)
+            code, body, *rest = self._route(path)
+            headers = rest[0] if rest else {}
         finally:
             with STATS.lock:
                 STATS.inflight[port] -= 1
                 STATS.inflight_total -= 1
 
         try:
-            self._send(code, body)
+            self._send(code, body, headers)
         except (BrokenPipeError, ConnectionResetError):
             pass   # клиент ушёл раньше — это не ошибка сервера
 
-    def _send(self, code: int, body: str) -> None:
+    def _send(self, code: int, body: str, headers: dict | None = None) -> None:
         data = body.encode("utf-8")
         self.send_response(code)
         self.send_header("Content-Type", "text/html; charset=utf-8")
         self.send_header("Content-Length", str(len(data)))
+        for name, value in (headers or {}).items():
+            self.send_header(name, value)
         self.end_headers()
         self.wfile.write(data)
 
-    def _route(self, path: str) -> tuple[int, str]:
-        """Готовит ответ: (код, тело). Отправляет его do_GET."""
+    def _route(self, path: str) -> tuple:
+        """Готовит ответ: (код, тело) или (код, тело, заголовки)."""
         if path == "/ok":
             return 200, page("OK")
+        # День 5. /flaky/<ключ>/<N> — первые N раз отвечает 503, потом 200.
+        # /flaky429/<ключ>/<N> — то же с 429 и заголовком Retry-After: 1.
+        if path.startswith(("/flaky/", "/flaky429/")):
+            kind, key, n = path.strip("/").split("/")
+            with STATS.lock:
+                STATS.flaky[key] += 1
+                count = STATS.flaky[key]
+            if count <= int(n):
+                if kind == "flaky429":
+                    return 429, page("Слишком часто"), {"Retry-After": "1"}
+                return 503, page("Перегружен")
+            return 200, page("Получилось")
         if path.startswith("/delay/"):
             time.sleep(float(path.rsplit("/", 1)[1]))
             return 200, page("Задержка")
@@ -681,6 +706,204 @@ async def _(B, B2):
     assert abs(st["avg_interval"] - 0.3) < 0.06, st
     assert st["blocked_by_robots"] == 1 and st["total_requests"] == 4, st
     assert st["crawl_delay"] == {f"127.0.0.1:{port_of(B)}": 0.3}, st["crawl_delay"]
+
+
+# ---------- День 5 ----------
+
+def fast_retry(**kw) -> RetryStrategy:
+    """Короткие паузы, чтобы проверки шли быстро."""
+    params = dict(max_retries=3, base_delay=0.1, backoff_factor=2.0,
+                  base_delay_by_type={}, timeout_growth=1.0)
+    params.update(kw)
+    return RetryStrategy(**params)
+
+
+@check("День 5", "ошибки классифицируются правильно")
+async def _(B, B2):
+    for status in (404, 403, 401):
+        assert type(classify_status("u", status, "")) is PermanentError, status
+    for status in (500, 502, 503, 504):
+        assert type(classify_status("u", status, "")) is TransientError, status
+    rl = classify_status("u", 429, "", "7")
+    assert isinstance(rl, RateLimitedError) and isinstance(rl, TransientError) and rl.retry_after == 7.0
+    assert type(classify_exception(asyncio.TimeoutError(), "u")) is TransientError
+    assert type(classify_exception(UnicodeDecodeError("utf-8", b"", 0, 1, "x"), "u")) is ParseError
+
+    c = AsyncCrawler()
+    try:
+        await c.fetch_url(f"http://127.0.0.1:{closed_port()}/")
+        await c.fetch_url(f"{B}/status/404")
+    finally:
+        await c.close()
+    kinds = sorted(d["type"] for d in c.error_details.values())
+    assert kinds == ["NetworkError", "PermanentError"], kinds
+
+
+@check("День 5", "без retry_strategy повторов нет (как в днях 1-4)")
+async def _(B, B2):
+    STATS.reset()
+    c = AsyncCrawler()
+    try:
+        r = await c.fetch_url(f"{B}/flaky/norepeat/1")
+    finally:
+        await c.close()
+    assert r is None and STATS.flaky["norepeat"] == 1, STATS.flaky
+
+
+@check("День 5", "503: повтор и успех со 3-й попытки")
+async def _(B, B2):
+    STATS.reset()
+    c = AsyncCrawler(retry_strategy=fast_retry())
+    try:
+        html = await c.fetch_url(f"{B}/flaky/k503/2")
+    finally:
+        await c.close()
+    assert html and "Получилось" in html
+    assert STATS.flaky["k503"] == 3, f"сервер получил {STATS.flaky['k503']} попыток, ожидали 3"
+    assert c.retry_strategy.successful_retries == 1
+
+
+@check("День 5", "404 и 403 не повторяются")
+async def _(B, B2):
+    STATS.reset()
+    c = AsyncCrawler(retry_strategy=fast_retry())
+    try:
+        await c.fetch_url(f"{B}/status/404")
+        await c.fetch_url(f"{B}/status/403")
+    finally:
+        await c.close()
+    hits = {path: n for (port, path), n in STATS.hits.items()}
+    assert hits == {"/status/404": 1, "/status/403": 1}, hits
+    assert c.error_details[f"{B}/status/404"]["type"] == "PermanentError"
+    assert c.retry_strategy.permanent_error_urls == [f"{B}/status/404", f"{B}/status/403"]
+
+
+@check("День 5", "экспоненциальный backoff: паузы 0.1 → 0.2 → 0.4")
+async def _(B, B2):
+    STATS.reset()
+    c = AsyncCrawler(retry_strategy=fast_retry())
+    try:
+        await c.fetch_url(f"{B}/flaky/kexp/3")
+    finally:
+        await c.close()
+    g = gaps(port_of(B))
+    expected = [0.1, 0.2, 0.4]
+    assert len(g) == 3 and all(abs(a - e) < 0.07 for a, e in zip(g, expected)), (
+        f"паузы {[round(x, 3) for x in g]}, ожидали ~{expected}")
+
+
+@check("День 5", "429: пауза не меньше Retry-After")
+async def _(B, B2):
+    STATS.reset()
+    c = AsyncCrawler(retry_strategy=fast_retry())
+    try:
+        html = await c.fetch_url(f"{B}/flaky429/k429/1")
+    finally:
+        await c.close()
+    g = gaps(port_of(B))
+    assert html and len(g) == 1, (html, g)
+    assert g[0] >= 1.0 - EPS, f"пауза {g[0]:.2f} c, а сервер просил подождать 1 c"
+
+
+@check("День 5", "500: только один повтор")
+async def _(B, B2):
+    STATS.reset()
+    c = AsyncCrawler(retry_strategy=fast_retry())
+    try:
+        r = await c.fetch_url(f"{B}/status/500")
+    finally:
+        await c.close()
+    assert r is None and STATS.hits[(port_of(B), "/status/500")] == 2, dict(STATS.hits)
+    assert c.error_details[f"{B}/status/500"]["attempts"] == 2
+
+
+@check("День 5", "сетевая ошибка: не больше 2 повторов")
+async def _(B, B2):
+    url = f"http://127.0.0.1:{closed_port()}/"
+    c = AsyncCrawler(retry_strategy=fast_retry(base_delay_by_type={NetworkError: 0.05}))
+    try:
+        r = await c.fetch_url(url)
+    finally:
+        await c.close()
+    assert r is None
+    assert c.error_details[url]["type"] == "NetworkError"
+    assert c.error_details[url]["attempts"] == 3, c.error_details[url]
+
+
+@check("День 5", "таймаут повторяется, и таймаут растёт с каждой попыткой")
+async def _(B, B2):
+    # Сервер думает 0.45 c, таймаут 0.3 c. Без роста все попытки упадут,
+    # с ростом в 2 раза вторая попытка (0.6 c) успеет.
+    url = f"{B}/slowhang/0.45"
+    STATS.reset()
+    c = AsyncCrawler(total_timeout=0.3, retry_strategy=fast_retry(max_retries=2, timeout_growth=1.0))
+    try:
+        r1 = await c.fetch_url(url)
+    finally:
+        await c.close()
+    assert r1 is None and c.error_details[url]["type"] == "TransientError"
+    assert STATS.hits[(port_of(B), "/slowhang/0.45")] == 3
+
+    STATS.reset()
+    c = AsyncCrawler(total_timeout=0.3, retry_strategy=fast_retry(max_retries=2, timeout_growth=2.0))
+    try:
+        r2 = await c.fetch_url(url)
+    finally:
+        await c.close()
+    assert r2 and STATS.hits[(port_of(B), "/slowhang/0.45")] == 2, dict(STATS.hits)
+
+
+@check("День 5", "execute_with_retry напрямую с fetch_once (пример из задания)")
+async def _(B, B2):
+    STATS.reset()
+    c = AsyncCrawler()
+    strategy = fast_retry(retry_on=[TransientError, NetworkError])
+    try:
+        html = await strategy.execute_with_retry(c.fetch_once, f"{B}/flaky/kdirect/1")
+        try:
+            await strategy.execute_with_retry(c.fetch_once, f"{B}/status/404")
+            raised = None
+        except PermanentError as e:
+            raised = e
+    finally:
+        await c.close()
+    assert html and STATS.flaky["kdirect"] == 2
+    assert raised is not None and raised.status == 404 and raised.attempts == 1
+
+
+@check("День 5", "circuit breaker: блокировка домена и восстановление")
+async def _(B, B2):
+    STATS.reset()
+    breaker = CircuitBreaker(failure_threshold=3, recovery_timeout=0.5)
+    c = AsyncCrawler(circuit_breaker=breaker)
+    try:
+        for _ in range(3):
+            await c.fetch_url(f"{B}/status/503")
+        await c.fetch_url(f"{B}/ok")                 # автомат выбит — до сервера не дойдёт
+        hits_while_open = sum(STATS.hits.values())
+        await asyncio.sleep(0.6)
+        probe = await c.fetch_url(f"{B}/ok?probe=1")  # пробный запрос
+    finally:
+        await c.close()
+    assert hits_while_open == 3, f"пока автомат выбит, сервер получил {hits_while_open} запросов"
+    assert c.error_details[f"{B}/ok"]["type"] == "CircuitOpenError"
+    assert probe and breaker.state(f"127.0.0.1:{port_of(B)}") == "closed"
+
+
+@check("День 5", "статистика ошибок")
+async def _(B, B2):
+    c = AsyncCrawler(retry_strategy=fast_retry())
+    try:
+        await c.fetch_urls([f"{B}/flaky/kstat/1", f"{B}/status/404", f"{B}/status/500", f"{B}/ok"])
+    finally:
+        await c.close()
+    st = c.get_error_stats()
+    r = st["retries"]
+    assert st["final_errors_by_type"] == {"PermanentError": 1, "TransientError": 1}, st
+    assert st["permanent_error_urls"] == [f"{B}/status/404"]
+    assert r["errors_by_type"] == {"TransientError": 3, "PermanentError": 1}, r
+    assert r["total_retries"] == 2 and r["successful_retries"] == 1, r
+    assert r["failed_after_retries"] == 1 and abs(r["avg_retry_delay"] - 0.1) < 1e-9, r
 
 
 # ============================================================

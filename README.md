@@ -21,13 +21,17 @@
 │   ├── crawler_queue.py      # очередь URL с приоритетами
 │   ├── semaphore_manager.py  # лимиты: общий и на домен
 │   ├── rate_limiter.py       # частота запросов, паузы, backoff
-│   └── robots_parser.py      # разбор и соблюдение robots.txt
+│   ├── robots_parser.py      # разбор и соблюдение robots.txt
+│   ├── errors.py             # типы ошибок и их классификация
+│   ├── retry_strategy.py     # повторы с экспоненциальным backoff
+│   └── circuit_breaker.py    # временная блокировка «лежащего» домена
 ├── demos/                # демонстрации и проверки по дням
 │   ├── __init__.py
 │   ├── demo_day1.py
 │   ├── demo_day2.py
 │   ├── demo_day3.py
-│   └── demo_day4.py
+│   ├── demo_day4.py
+│   └── demo_day5.py
 ├── tests/                # сквозная проверка всех дней
 │   ├── __init__.py
 │   └── check_all.py
@@ -65,6 +69,7 @@ python -m demos.demo_day1
 python -m demos.demo_day2
 python -m demos.demo_day3
 python -m demos.demo_day4
+python -m demos.demo_day5
 ```
 
 **Почему `-m`, а не `python demos/demo_day1.py`.** Python при запуске
@@ -95,7 +100,7 @@ python -m tests.check_all
 | 2 | Парсинг HTML и извлечение данных | `day2` | готово |
 | 3 | Очереди и управление конкурентностью | `day3` | готово |
 | 4 | Rate limiting и правила вежливости | `day4` | готово |
-| 5 | — | `day5` | — |
+| 5 | Обработка ошибок и автоматические повторы | `day5` | готово |
 | 6 | — | `day6` | — |
 | 7 | — | `day7` | — |
 

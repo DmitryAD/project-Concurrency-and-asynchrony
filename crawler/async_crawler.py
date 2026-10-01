@@ -8,6 +8,9 @@
 День 4 — вежливость: ограничение частоты запросов, robots.txt,
          паузы, User-Agent. По умолчанию всё выключено — поведение
          дней 1-3 не меняется, пока не включишь явно.
+День 5 — классификация ошибок, автоматические повторы, circuit breaker.
+         Тоже выключено по умолчанию: без retry_strategy каждый URL
+         запрашивается ровно один раз, как в днях 1-4.
 
 Настройка логирования и запуск — в демо-скриптах: библиотека пишет
 в логгер, но не решает за приложение, куда и в каком формате выводить.
@@ -20,13 +23,24 @@ import itertools
 import logging
 import re
 import time
+from collections import Counter
 from urllib.parse import urlparse
 
 import aiohttp
 
+from crawler.circuit_breaker import CircuitBreaker
 from crawler.crawler_queue import CrawlerQueue
+from crawler.errors import (
+    CrawlerError,
+    NetworkError,
+    ParseError,
+    TransientError,
+    classify_exception,
+    classify_status,
+)
 from crawler.html_parser import HTMLParser
 from crawler.rate_limiter import RateLimiter
+from crawler.retry_strategy import RetryStrategy
 from crawler.robots_parser import RobotsParser
 from crawler.semaphore_manager import SemaphoreManager
 
@@ -62,6 +76,9 @@ class AsyncCrawler:
             min_delay=0.5,
             user_agent="MyBot/1.0",
         )
+
+    Повторы при ошибках (день 5):
+        crawler = AsyncCrawler(retry_strategy=RetryStrategy(max_retries=3))
     """
 
     def __init__(
@@ -82,6 +99,8 @@ class AsyncCrawler:
         respect_robots: bool = False,
         user_agent: str | None = None,
         user_agents: list[str] | None = None,
+        retry_strategy: RetryStrategy | None = None,
+        circuit_breaker: CircuitBreaker | None = None,
     ) -> None:
         """
         max_concurrent — сколько запросов летит одновременно всего.
@@ -121,6 +140,12 @@ class AsyncCrawler:
         user_agents — список для ротации: каждый запрос берёт
             следующий по кругу. Правила robots.txt при этом всё
             равно проверяются для основного имени — первого в списке.
+
+        День 5 (выключено по умолчанию):
+        retry_strategy — правила повторов при ошибках. None — без
+            повторов, каждый URL запрашивается один раз.
+        circuit_breaker — автомат, временно блокирующий домен, который
+            подряд отвечает ошибками. None — без автомата.
         """
         self.max_concurrent = max_concurrent
         self.max_depth = max_depth
@@ -174,6 +199,12 @@ class AsyncCrawler:
         self._ua_cycle = itertools.cycle(user_agents) if user_agents else None
         self.blocked_urls: set[str] = set()          # запрещены robots.txt
 
+        # День 5: повторы и подробности об ошибках.
+        self.retry_strategy = retry_strategy
+        self.circuit_breaker = circuit_breaker
+        self.error_details: dict[str, dict] = {}     # url -> тип, код, попытки
+        self.error_counts: Counter = Counter()       # итоговые ошибки по типам
+
     # ---------- сессия ----------
 
     def _ensure_session(self) -> aiohttp.ClientSession:
@@ -204,16 +235,69 @@ class AsyncCrawler:
         Загружает одну страницу.
 
         Возвращает HTML или None, если запрос не удался. Исключения
-        наружу не пробрасываются.
+        наружу не пробрасываются — это обещание дня 1 остаётся в силе.
+
+        День 5: если задана retry_strategy, неудачные попытки
+        повторяются по её правилам. Причина окончательной неудачи
+        остаётся в self.errors, подробности — в self.error_details.
+        """
+        # День 4: сначала robots.txt. Запрещённый адрес не занимает
+        # ни слот семафора, ни окно в лимите скорости, и не повторяется.
+        if self.respect_robots and not await self._robots_allows(url):
+            self._record_blocked(url)
+            return None
+
+        try:
+            if self.retry_strategy is None:
+                html = await self.fetch_once(url)
+            else:
+                html = await self._fetch_with_retries(url)
+        except CrawlerError as err:
+            self._record_error(url, err.reason, err)
+            return None
+
+        self.successful += 1
+        return html
+
+    async def _fetch_with_retries(self, url: str) -> str:
+        """
+        Повторы через RetryStrategy. Каждая следующая попытка получает
+        таймаут больше предыдущего (пункт 6): если сайт отвечает
+        медленно, ещё одна попытка с тем же таймаутом упадёт так же.
+        """
+        assert self.retry_strategy is not None
+        attempt = 0
+
+        async def one_attempt(u: str) -> str:
+            nonlocal attempt
+            attempt += 1
+            scale = self.retry_strategy.timeout_growth ** (attempt - 1)
+            return await self.fetch_once(u, timeout_scale=scale)
+
+        return await self.retry_strategy.execute_with_retry(one_attempt, url)
+
+    async def fetch_once(self, url: str, timeout_scale: float = 1.0) -> str:
+        """
+        Ровно одна попытка загрузки. При неудаче БРОСАЕТ ошибку одного
+        из типов CrawlerError — TransientError, PermanentError,
+        NetworkError и т. д.
+
+        Именно эту функцию можно передавать в RetryStrategy напрямую:
+
+            await strategy.execute_with_retry(crawler.fetch_once, url)
+
+        fetch_url для этого не подходит: он ошибки не бросает, а
+        возвращает None, и стратегия не поймёт, что нужно повторить.
+
+        timeout_scale — во сколько раз увеличить таймауты этой попытки.
         """
         session = self._ensure_session()
         domain = urlparse(url).netloc.lower()
 
-        # День 4: сначала robots.txt. Запрещённый адрес не занимает
-        # ни слот семафора, ни окно в лимите скорости.
-        if self.respect_robots and not await self._robots_allows(url):
-            self._record_blocked(url)
-            return None
+        # День 5: автомат-предохранитель. Если домен «выбит», запрос
+        # отклоняется сразу, не уходя в сеть.
+        if self.circuit_breaker is not None:
+            self.circuit_breaker.check(domain, url)
 
         # День 3: слот занимается сразу на двух уровнях — у домена
         # и глобально. Подробности — в SemaphoreManager.acquire.
@@ -226,22 +310,17 @@ class AsyncCrawler:
             logger.info("Начинаю загрузку %s", url)
 
             ua = self._next_user_agent()
-            headers = {"User-Agent": ua} if ua else None
+            extra: dict = {}
+            if ua:
+                extra["headers"] = {"User-Agent": ua}
+            if timeout_scale != 1.0:
+                extra["timeout"] = self._scaled_timeout(timeout_scale)
 
             try:
-                async with session.get(url, headers=headers) as response:
+                async with session.get(url, **extra) as response:
                     # Превращает HTTP 4xx/5xx в ClientResponseError.
                     response.raise_for_status()
-
                     html = await response.text()
-
-                    self.successful += 1
-                    self.rate_limiter.report_success(domain)
-                    logger.info(
-                        "Успешно %s — статус %d, %d символов",
-                        url, response.status, len(html),
-                    )
-                    return html
 
             # ВАЖЕН ПОРЯДОК except — от частного к общему:
             #
@@ -252,31 +331,79 @@ class AsyncCrawler:
             #           └── ServerTimeoutError  ← он же asyncio.TimeoutError
 
             except aiohttp.ClientResponseError as e:
-                self._record_error(url, f"ClientResponseError: HTTP {e.status}")
+                headers = getattr(e, "headers", None) or {}
+                err = classify_status(url, e.status, f"ClientResponseError: HTTP {e.status}",
+                                      headers.get("Retry-After"))
                 # 429 «слишком часто» и 5xx «серверу плохо» — сигнал
                 # притормозить. 404 — просто нет страницы, это не повод.
-                if e.status == 429 or e.status >= 500:
-                    self.rate_limiter.report_error(domain)
+                if isinstance(err, TransientError):
+                    self._domain_failed(domain)
+                raise err from e
 
-            except asyncio.TimeoutError:
-                self._record_error(url, "TimeoutError: превышен таймаут")
-                self.rate_limiter.report_error(domain)
+            except asyncio.TimeoutError as e:
+                self._domain_failed(domain)
+                raise TransientError(url, "TimeoutError: превышен таймаут") from e
 
             except aiohttp.ClientError as e:
-                self._record_error(url, f"{type(e).__name__}: {e}")
-                self.rate_limiter.report_error(domain)
+                self._domain_failed(domain)
+                raise NetworkError(url, f"{type(e).__name__}: {e}") from e
 
             except Exception as e:            # noqa: BLE001
                 logger.exception("Непредвиденная ошибка на %s", url)
-                self._record_error(url, f"{type(e).__name__}: {e}")
+                raise classify_exception(e, url) from e
 
-            return None
+        self.rate_limiter.report_success(domain)
+        if self.circuit_breaker is not None:
+            self.circuit_breaker.record_success(domain)
+        logger.info("Успешно %s — статус %d, %d символов", url, response.status, len(html))
+        return html
 
-    def _record_error(self, url: str, reason: str) -> None:
+    def _domain_failed(self, domain: str) -> None:
+        """Сервер не в порядке: сообщить лимитеру (день 4) и автомату (день 5)."""
+        self.rate_limiter.report_error(domain)
+        if self.circuit_breaker is not None:
+            self.circuit_breaker.record_failure(domain)
+
+    def _scaled_timeout(self, scale: float) -> aiohttp.ClientTimeout:
+        t = self._timeout
+        return aiohttp.ClientTimeout(
+            total=t.total * scale if t.total else None,
+            connect=t.connect * scale if t.connect else None,
+            sock_read=t.sock_read * scale if t.sock_read else None,
+        )
+
+    def _record_error(self, url: str, reason: str, err: CrawlerError | None = None) -> None:
         """Логировать ошибки с URL и типом ошибки."""
         self.failed += 1
         self.errors[url] = reason
-        logger.warning("Ошибка на %s — %s", url, reason)
+        if err is not None:
+            kind = type(err).__name__
+            self.error_counts[kind] += 1
+            self.error_details[url] = {
+                "type": kind,
+                "status": err.status,
+                "reason": reason,
+                "attempts": err.attempts,
+            }
+            logger.warning("Ошибка на %s — %s: %s (попыток: %d)",
+                           url, kind, reason, err.attempts)
+        else:
+            logger.warning("Ошибка на %s — %s", url, reason)
+
+    def get_error_stats(self) -> dict:
+        """Пункт 9: итоговая статистика ошибок."""
+        stats: dict = {
+            "final_errors_by_type": dict(self.error_counts),
+            "failed_urls": len(self.error_details),
+            "permanent_error_urls": sorted(
+                u for u, d in self.error_details.items() if d["type"] == "PermanentError"
+            ),
+        }
+        if self.retry_strategy is not None:
+            stats["retries"] = self.retry_strategy.get_stats()
+        if self.circuit_breaker is not None:
+            stats["circuit_breaker"] = self.circuit_breaker.get_stats()
+        return stats
 
     # ---------- день 4: robots.txt и User-Agent ----------
 
@@ -364,7 +491,20 @@ class AsyncCrawler:
                           else self.errors.get(url, "не удалось загрузить")),
             }
 
-        result = await self.html_parser.parse_html(html, url)
+        try:
+            result = await self.html_parser.parse_html(html, url)
+        except Exception as e:  # noqa: BLE001
+            # День 5: ParseError. Не повторяем: тот же HTML разберётся
+            # с той же ошибкой.
+            err = ParseError(url, f"ParseError: {type(e).__name__}: {e}")
+            self._record_error(url, err.reason, err)
+            return {"url": url, "title": "", "text": "", "links": [], "metadata": {},
+                    "images": [], "headings": {}, "tables": [], "lists": [],
+                    "parse_errors": [err.reason], "error": err.reason}
+
+        if result["parse_errors"]:
+            # Разобрали частично — это не провал, но учесть стоит
+            self.error_counts["ParseError (частично)"] += 1
         result["error"] = None
         return result
 
