@@ -31,7 +31,7 @@ import traceback
 from collections import Counter, defaultdict
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-from crawler import AsyncCrawler, CrawlerQueue, HTMLParser
+from crawler import AsyncCrawler, CrawlerQueue, HTMLParser, RobotsParser
 
 
 # ============================================================
@@ -60,6 +60,16 @@ SITE = {
     "/site/x": [],
 }
 
+# robots.txt тестового сайта (день 4). Раздаётся обоими серверами.
+ROBOTS_TXT = """
+User-agent: *
+Disallow: /site/private
+Crawl-delay: 0.3
+
+User-agent: BlockedBot
+Disallow: /
+"""
+
 # Страница для проверки разбора (день 2)
 PARSE_PAGE = (
     '<html><head><title>Разбор</title>'
@@ -83,6 +93,8 @@ class Stats:
         self.inflight = defaultdict(int)     # порт -> сейчас
         self.peak = defaultdict(int)         # порт -> пик
         self.hits = Counter()                # (порт, путь) -> сколько раз
+        self.starts = defaultdict(list)      # порт -> [(время начала, путь)]
+        self.user_agents = []                # заголовки User-Agent по порядку
 
 
 STATS = Stats()
@@ -111,6 +123,8 @@ class Handler(BaseHTTPRequestHandler):
 
         with STATS.lock:
             STATS.hits[(port, path)] += 1
+            STATS.starts[port].append((time.monotonic(), path))
+            STATS.user_agents.append(self.headers.get("User-Agent", ""))
             STATS.inflight[port] += 1
             STATS.inflight_total += 1
             STATS.peak[port] = max(STATS.peak[port], STATS.inflight[port])
@@ -152,6 +166,8 @@ class Handler(BaseHTTPRequestHandler):
             return code, page(f"Код {code}")
         if path == "/parse":
             return 200, PARSE_PAGE
+        if path == "/robots.txt":
+            return 200, ROBOTS_TXT
         if path in SITE and path != "/site/c":
             links = [self.external if link == "EXTERNAL" else link for link in SITE[path]]
             return 200, page(path, *links)
@@ -478,6 +494,193 @@ async def _(B, B2):
         await c.close()
     assert len(c.visited_urls) == 4, len(c.visited_urls)
     assert sum(STATS.hits.values()) == 4, sum(STATS.hits.values())
+
+
+# ---------- День 4 ----------
+
+def gaps(port: int, skip_robots: bool = True) -> list[float]:
+    """Паузы между началами соседних запросов, как их видел сервер."""
+    times = [t for t, path in STATS.starts[port] if not (skip_robots and path == "/robots.txt")]
+    return [b - a for a, b in zip(times, times[1:])]
+
+
+EPS = 0.03   # допуск на неточность таймеров
+
+
+@check("День 4", "один домен: не чаще 5 запросов в секунду")
+async def _(B, B2):
+    STATS.reset()
+    c = AsyncCrawler(max_concurrent=10, requests_per_second=5)
+    t = time.perf_counter()
+    try:
+        await c.fetch_urls([f"{B}/ok?n={i}" for i in range(6)])
+    finally:
+        await c.close()
+    dt = time.perf_counter() - t
+    g = gaps(port_of(B))
+    assert len(g) == 5 and min(g) >= 0.2 - EPS, f"паузы {[round(x, 3) for x in g]}"
+    assert dt >= 1.0 - EPS, f"6 запросов за {dt:.2f} c, а при 5/с нужно не меньше 1.0"
+
+
+@check("День 4", "разные домены: у каждого свой лимит")
+async def _(B, B2):
+    STATS.reset()
+    c = AsyncCrawler(max_concurrent=10, requests_per_second=2)
+    t = time.perf_counter()
+    try:
+        await c.fetch_urls([f"{base}/ok?n={i}" for i in range(3) for base in (B, B2)])
+    finally:
+        await c.close()
+    dt = time.perf_counter() - t
+    for port in (port_of(B), port_of(B2)):
+        g = gaps(port)
+        assert min(g) >= 0.5 - EPS, f"сервер {port}: паузы {[round(x, 3) for x in g]}"
+    # Лимиты независимы: два сайта по 3 запроса идут параллельно, ~1.0 c.
+    # Будь лимит общим, вышло бы ~2.5 c.
+    assert dt < 1.6, f"заняло {dt:.2f} c — похоже, лимит общий, а не по доменам"
+
+
+@check("День 4", "rate_per_domain=False: один лимит на все домены")
+async def _(B, B2):
+    STATS.reset()
+    c = AsyncCrawler(max_concurrent=10, requests_per_second=5, rate_per_domain=False)
+    t = time.perf_counter()
+    try:
+        await c.fetch_urls([f"{base}/ok?n={i}" for i in range(3) for base in (B, B2)])
+    finally:
+        await c.close()
+    dt = time.perf_counter() - t
+    merged = sorted(t for port in (port_of(B), port_of(B2)) for t, _ in STATS.starts[port])
+    g = [b - a for a, b in zip(merged, merged[1:])]
+    assert min(g) >= 0.2 - EPS, f"общие паузы {[round(x, 3) for x in g]}"
+    assert dt >= 1.0 - EPS, f"6 запросов за {dt:.2f} c"
+
+
+@check("День 4", "robots.txt разбирается по стандарту")
+async def _(B, B2):
+    r = RobotsParser()
+    r.parse("""
+        User-agent: *
+        Disallow: /private
+        Allow: /private/public
+        Disallow: /*.pdf$
+        Crawl-delay: 2
+        User-agent: MyBot
+        Disallow: /mine
+    """, "https://r.test/robots.txt")
+    expect = {
+        ("https://r.test/page", "*"): True,
+        ("https://r.test/private/x", "*"): False,
+        ("https://r.test/private/public/x", "*"): True,     # длиннее правило побеждает
+        ("https://r.test/a/b.pdf", "*"): False,             # * и $
+        ("https://r.test/a/b.pdf?v=1", "*"): True,
+        ("https://r.test/private/x", "MyBot/1.0"): True,     # своя группа
+        ("https://r.test/mine", "MyBot/1.0"): False,
+    }
+    wrong = {k: r.can_fetch(*k) for k in expect if r.can_fetch(*k) != expect[k]}
+    assert not wrong, f"неверно: {wrong}"
+    assert r.get_crawl_delay("*", "https://r.test/") == 2.0
+    assert r.get_crawl_delay("MyBot/1.0", "https://r.test/") == 0.0
+
+
+@check("День 4", "запрещённые robots.txt адреса не запрашиваются")
+async def _(B, B2):
+    STATS.reset()
+    c = AsyncCrawler(max_concurrent=10, max_depth=5, respect_robots=True)
+    try:
+        await c.crawl([f"{B}/site/"], same_domain_only=True)
+    finally:
+        await c.close()
+    hits = {path: n for (port, path), n in STATS.hits.items() if port == port_of(B)}
+    assert not any(p.startswith("/site/private") for p in hits), f"сервер получил: {sorted(hits)}"
+    assert c.blocked_urls == {f"{B}/site/private/login"}, c.blocked_urls
+    # Запрет — не ошибка: адрес не должен попасть в failed_urls
+    # и тратить лимит страниц
+    assert f"{B}/site/private/login" not in c.failed_urls, c.failed_urls
+    assert c.queue_stats["skipped"] >= 1, c.queue_stats
+    assert hits.get("/robots.txt") == 1, f"robots.txt скачан {hits.get('/robots.txt')} раз, а надо 1"
+    assert "/site/a/1/deep" in hits, "разрешённые страницы тоже должны обходиться"
+
+
+@check("День 4", "Crawl-delay из robots.txt соблюдается")
+async def _(B, B2):
+    STATS.reset()
+    c = AsyncCrawler(max_concurrent=10, max_depth=1, respect_robots=True)
+    try:
+        await c.crawl([f"{B}/site/"], same_domain_only=True)
+    finally:
+        await c.close()
+    g = gaps(port_of(B))
+    assert g and min(g) >= 0.3 - EPS, f"паузы {[round(x, 3) for x in g]}, а Crawl-delay 0.3"
+
+
+@check("День 4", "правила robots.txt для конкретного User-Agent")
+async def _(B, B2):
+    STATS.reset()
+    c = AsyncCrawler(max_depth=2, respect_robots=True, user_agent="BlockedBot/1.0")
+    try:
+        res = await c.crawl([f"{B}/site/"])
+    finally:
+        await c.close()
+    paths = [path for (_, path) in STATS.hits]
+    assert paths == ["/robots.txt"], f"сервер получил: {paths}"
+    assert res == {} and c.blocked_urls == {f"{B}/site/"}
+
+
+@check("День 4", "min_delay и jitter: паузы от 0.2 до 0.4 c и не одинаковые")
+async def _(B, B2):
+    STATS.reset()
+    c = AsyncCrawler(max_concurrent=10, min_delay=0.2, jitter=0.2)
+    try:
+        await c.fetch_urls([f"{B}/ok?n={i}" for i in range(7)])
+    finally:
+        await c.close()
+    g = gaps(port_of(B))
+    assert min(g) >= 0.2 - EPS and max(g) <= 0.4 + EPS, f"паузы {[round(x, 3) for x in g]}"
+    assert max(g) - min(g) > 0.02, f"паузы почти одинаковые: {[round(x, 3) for x in g]}"
+
+
+@check("День 4", "экспоненциальный backoff после ошибок и сброс после успеха")
+async def _(B, B2):
+    STATS.reset()
+    c = AsyncCrawler(max_concurrent=1, error_backoff=0.2)
+    try:
+        for path in ("/status/500", "/status/500", "/status/500", "/ok", "/ok?n=2"):
+            await c.fetch_url(f"{B}{path}")
+    finally:
+        await c.close()
+    g = gaps(port_of(B))
+    # после 1-й ошибки пауза 0.2, после 2-й 0.4, после 3-й 0.8, после успеха 0
+    expected = [0.2, 0.4, 0.8, 0.0]
+    ok = all(abs(a - e) < 0.12 for a, e in zip(g, expected))
+    assert ok and len(g) == 4, f"паузы {[round(x, 3) for x in g]}, ожидали ~{expected}"
+
+
+@check("День 4", "User-Agent передаётся и ротируется")
+async def _(B, B2):
+    STATS.reset()
+    c = AsyncCrawler(max_concurrent=1, user_agents=["BotA/1.0", "BotB/1.0"])
+    try:
+        for i in range(4):
+            await c.fetch_url(f"{B}/ok?n={i}")
+    finally:
+        await c.close()
+    assert STATS.user_agents == ["BotA/1.0", "BotB/1.0", "BotA/1.0", "BotB/1.0"], STATS.user_agents
+    assert c.user_agent == "BotA/1.0", "для robots.txt основное имя — первое в списке"
+
+
+@check("День 4", "статистика: скорость, средняя пауза, заблокированные")
+async def _(B, B2):
+    c = AsyncCrawler(max_concurrent=10, max_depth=1, requests_per_second=4, respect_robots=True)
+    try:
+        await c.crawl([f"{B}/site/"], same_domain_only=True)
+    finally:
+        await c.close()
+    st = c.get_rate_stats()
+    # Crawl-delay 0.3 строже, чем 4 запроса/с (0.25), — действует он
+    assert abs(st["avg_interval"] - 0.3) < 0.06, st
+    assert st["blocked_by_robots"] == 1 and st["total_requests"] == 4, st
+    assert st["crawl_delay"] == {f"127.0.0.1:{port_of(B)}": 0.3}, st["crawl_delay"]
 
 
 # ============================================================

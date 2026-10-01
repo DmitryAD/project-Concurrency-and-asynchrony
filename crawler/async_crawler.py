@@ -5,6 +5,9 @@
 День 2 — метод fetch_and_parse: загрузить и сразу разобрать.
 День 3 — метод crawl: обход сайта по ссылкам через очередь,
          с ограничением глубины, фильтрами и лимитами на домен.
+День 4 — вежливость: ограничение частоты запросов, robots.txt,
+         паузы, User-Agent. По умолчанию всё выключено — поведение
+         дней 1-3 не меняется, пока не включишь явно.
 
 Настройка логирования и запуск — в демо-скриптах: библиотека пишет
 в логгер, но не решает за приложение, куда и в каком формате выводить.
@@ -13,6 +16,7 @@
 from __future__ import annotations
 
 import asyncio
+import itertools
 import logging
 import re
 import time
@@ -22,6 +26,8 @@ import aiohttp
 
 from crawler.crawler_queue import CrawlerQueue
 from crawler.html_parser import HTMLParser
+from crawler.rate_limiter import RateLimiter
+from crawler.robots_parser import RobotsParser
 from crawler.semaphore_manager import SemaphoreManager
 
 # Логгер по имени модуля. Сам по себе ничего не печатает, пока
@@ -47,6 +53,15 @@ class AsyncCrawler:
     Обход сайта по ссылкам (день 3):
         crawler = AsyncCrawler(max_concurrent=10, max_depth=2)
         results = await crawler.crawl(["https://example.com"], max_pages=50)
+
+    Вежливый обход (день 4):
+        crawler = AsyncCrawler(
+            max_concurrent=5,
+            requests_per_second=2.0,
+            respect_robots=True,
+            min_delay=0.5,
+            user_agent="MyBot/1.0",
+        )
     """
 
     def __init__(
@@ -59,6 +74,14 @@ class AsyncCrawler:
         max_depth: int = 3,
         max_per_domain: int | None = None,
         progress_interval: float = 1.0,
+        requests_per_second: float | None = None,
+        rate_per_domain: bool = True,
+        min_delay: float = 0.0,
+        jitter: float = 0.0,
+        error_backoff: float = 0.0,
+        respect_robots: bool = False,
+        user_agent: str | None = None,
+        user_agents: list[str] | None = None,
     ) -> None:
         """
         max_concurrent — сколько запросов летит одновременно всего.
@@ -79,6 +102,25 @@ class AsyncCrawler:
         обхода чужих сайтов задавай явно, например 3-5.
 
         progress_interval — раз в сколько секунд печатать прогресс.
+
+        День 4 (всё выключено по умолчанию):
+        requests_per_second — не чаще стольких запросов в секунду.
+            None — без ограничения.
+        rate_per_domain — True: лимит у каждого домена свой.
+            False: один лимит на все запросы.
+        min_delay — минимальная пауза между запросами, секунды.
+        jitter — случайная добавка к паузе, от 0 до jitter секунд.
+        error_backoff — замедление после ошибок сервера (429, 5xx,
+            таймауты): пауза растёт вдвое с каждой ошибкой подряд,
+            начиная с этого значения. 0 — выключено.
+        respect_robots — проверять robots.txt: не ходить туда,
+            где запрещено, и соблюдать Crawl-delay.
+        user_agent — как краулер представляется сайтам. По нему же
+            выбираются правила в robots.txt. None — стандартный
+            заголовок aiohttp.
+        user_agents — список для ротации: каждый запрос берёт
+            следующий по кругу. Правила robots.txt при этом всё
+            равно проверяются для основного имени — первого в списке.
         """
         self.max_concurrent = max_concurrent
         self.max_depth = max_depth
@@ -118,6 +160,20 @@ class AsyncCrawler:
         self.skipped_by_depth: int = 0
         self.queue_stats: dict = {}                  # итог очереди после crawl()
 
+        # День 4: вежливость.
+        self.rate_limiter = RateLimiter(
+            requests_per_second=requests_per_second,
+            per_domain=rate_per_domain,
+            min_delay=min_delay,
+            jitter=jitter,
+            error_backoff=error_backoff,
+        )
+        self.respect_robots = respect_robots
+        self.robots = RobotsParser(fetcher=self._fetch_robots_text)
+        self.user_agent = user_agent or (user_agents[0] if user_agents else None)
+        self._ua_cycle = itertools.cycle(user_agents) if user_agents else None
+        self.blocked_urls: set[str] = set()          # запрещены robots.txt
+
     # ---------- сессия ----------
 
     def _ensure_session(self) -> aiohttp.ClientSession:
@@ -151,20 +207,36 @@ class AsyncCrawler:
         наружу не пробрасываются.
         """
         session = self._ensure_session()
+        domain = urlparse(url).netloc.lower()
+
+        # День 4: сначала robots.txt. Запрещённый адрес не занимает
+        # ни слот семафора, ни окно в лимите скорости.
+        if self.respect_robots and not await self._robots_allows(url):
+            self._record_blocked(url)
+            return None
 
         # День 3: слот занимается сразу на двух уровнях — у домена
         # и глобально. Подробности — в SemaphoreManager.acquire.
         async with self.semaphores.acquire(url):
+            # День 4: лимит скорости — ПОСЛЕДНИЙ шаг перед отправкой.
+            # Если поставить его раньше семафора, запрос мог бы получить
+            # разрешение, потом постоять в очереди за слотом и уйти
+            # вплотную к следующему — лимит бы нарушался.
+            await self.rate_limiter.acquire(domain)
             logger.info("Начинаю загрузку %s", url)
 
+            ua = self._next_user_agent()
+            headers = {"User-Agent": ua} if ua else None
+
             try:
-                async with session.get(url) as response:
+                async with session.get(url, headers=headers) as response:
                     # Превращает HTTP 4xx/5xx в ClientResponseError.
                     response.raise_for_status()
 
                     html = await response.text()
 
                     self.successful += 1
+                    self.rate_limiter.report_success(domain)
                     logger.info(
                         "Успешно %s — статус %d, %d символов",
                         url, response.status, len(html),
@@ -181,12 +253,18 @@ class AsyncCrawler:
 
             except aiohttp.ClientResponseError as e:
                 self._record_error(url, f"ClientResponseError: HTTP {e.status}")
+                # 429 «слишком часто» и 5xx «серверу плохо» — сигнал
+                # притормозить. 404 — просто нет страницы, это не повод.
+                if e.status == 429 or e.status >= 500:
+                    self.rate_limiter.report_error(domain)
 
             except asyncio.TimeoutError:
                 self._record_error(url, "TimeoutError: превышен таймаут")
+                self.rate_limiter.report_error(domain)
 
             except aiohttp.ClientError as e:
                 self._record_error(url, f"{type(e).__name__}: {e}")
+                self.rate_limiter.report_error(domain)
 
             except Exception as e:            # noqa: BLE001
                 logger.exception("Непредвиденная ошибка на %s", url)
@@ -199,6 +277,42 @@ class AsyncCrawler:
         self.failed += 1
         self.errors[url] = reason
         logger.warning("Ошибка на %s — %s", url, reason)
+
+    # ---------- день 4: robots.txt и User-Agent ----------
+
+    async def _robots_allows(self, url: str) -> bool:
+        """
+        Загружает robots.txt домена (один раз, дальше из кэша),
+        передаёт его Crawl-delay в лимитер и проверяет адрес.
+        """
+        domain = urlparse(url).netloc.lower()
+        await self.robots.fetch_robots(url)
+        delay = self.robots.get_crawl_delay(self.user_agent or "*", url)
+        if delay:
+            self.rate_limiter.set_crawl_delay(domain, delay)
+        return self.robots.can_fetch(url, self.user_agent or "*")
+
+    async def _fetch_robots_text(self, url: str) -> tuple[int, str]:
+        """Загрузка самого robots.txt — через ту же сессию краулера."""
+        session = self._ensure_session()
+        headers = {"User-Agent": self.user_agent} if self.user_agent else None
+        async with session.get(url, headers=headers) as response:
+            return response.status, await response.text()
+
+    def _record_blocked(self, url: str) -> None:
+        self.blocked_urls.add(url)
+        logger.warning("robots.txt запрещает %s — пропускаю", url)
+
+    def _next_user_agent(self) -> str | None:
+        if self._ua_cycle is not None:
+            return next(self._ua_cycle)
+        return self.user_agent
+
+    def get_rate_stats(self) -> dict:
+        """Пункт 7: скорость, средняя пауза, число заблокированных."""
+        stats = self.rate_limiter.get_stats()
+        stats["blocked_by_robots"] = len(self.blocked_urls)
+        return stats
 
     async def fetch_urls(self, urls: list[str]) -> dict[str, str]:
         """
@@ -246,7 +360,8 @@ class AsyncCrawler:
                 "tables": [],
                 "lists": [],
                 "parse_errors": [],
-                "error": self.errors.get(url, "не удалось загрузить"),
+                "error": ("запрещено robots.txt" if url in self.blocked_urls
+                          else self.errors.get(url, "не удалось загрузить")),
             }
 
         result = await self.html_parser.parse_html(html, url)
@@ -324,6 +439,20 @@ class AsyncCrawler:
                 url = await queue.get_next()
                 if url is None:           # сигнал «работы больше нет»
                     return
+
+                # День 4: запрещённое robots.txt не качаем и не тратим
+                # на него лимит страниц. Проверка стоит ДО подсчёта:
+                # между проверкой лимита и его увеличением ниже не должно
+                # быть ни одного await, иначе воркеры проскочат лимит.
+                if self.respect_robots:
+                    try:
+                        allowed = await self._robots_allows(url)
+                    except Exception:  # noqa: BLE001
+                        allowed = True
+                    if not allowed:
+                        self._record_blocked(url)
+                        queue.mark_skipped(url)
+                        continue
 
                 # Лимит страниц исчерпан — URL не качаем, просто
                 # отмечаем, чтобы очередь могла опустеть до конца.
@@ -407,10 +536,14 @@ class AsyncCrawler:
         stats = queue.get_stats()
         done = stats["processed"] + stats["failed"]
         speed = done / elapsed if elapsed > 0 else 0.0
+        rate = self.rate_limiter.get_stats()
         progress_logger.info(
             "%s обработано: %d | в очереди: %d | ошибок: %d | "
-            "активно: %d | %.1f стр/с | %.1f c",
+            "запрещено robots: %d | активно: %d | %.1f стр/с | "
+            "пауза %.2f c | %.1f c",
             "ИТОГ  " if final else "Прогресс",
             stats["processed"], stats["queued"], stats["failed"],
-            self.semaphores.get_stats()["active_total"], speed, elapsed,
+            len(self.blocked_urls),
+            self.semaphores.get_stats()["active_total"], speed,
+            rate["avg_interval"], elapsed,
         )
