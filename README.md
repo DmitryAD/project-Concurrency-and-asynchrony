@@ -9,6 +9,7 @@
 - `aiohttp` — асинхронный HTTP-клиент
 - `aiofiles` — асинхронная работа с файлами
 - `beautifulsoup4` + `lxml` — разбор HTML
+- `aiosqlite` — асинхронная работа с SQLite
 
 ## Структура
 
@@ -24,14 +25,16 @@
 │   ├── robots_parser.py      # разбор и соблюдение robots.txt
 │   ├── errors.py             # типы ошибок и их классификация
 │   ├── retry_strategy.py     # повторы с экспоненциальным backoff
-│   └── circuit_breaker.py    # временная блокировка «лежащего» домена
+│   ├── circuit_breaker.py    # временная блокировка «лежащего» домена
+│   └── storage.py            # сохранение: JSON, CSV, SQLite
 ├── demos/                # демонстрации и проверки по дням
 │   ├── __init__.py
 │   ├── demo_day1.py
 │   ├── demo_day2.py
 │   ├── demo_day3.py
 │   ├── demo_day4.py
-│   └── demo_day5.py
+│   ├── demo_day5.py
+│   └── demo_day6.py
 ├── tests/                # сквозная проверка всех дней
 │   ├── __init__.py
 │   └── check_all.py
@@ -70,6 +73,7 @@ python -m demos.demo_day2
 python -m demos.demo_day3
 python -m demos.demo_day4
 python -m demos.demo_day5
+python -m demos.demo_day6
 ```
 
 **Почему `-m`, а не `python demos/demo_day1.py`.** Python при запуске
@@ -101,7 +105,7 @@ python -m tests.check_all
 | 3 | Очереди и управление конкурентностью | `day3` | готово |
 | 4 | Rate limiting и правила вежливости | `day4` | готово |
 | 5 | Обработка ошибок и автоматические повторы | `day5` | готово |
-| 6 | — | `day6` | — |
+| 6 | Сохранение данных и работа с файлами | `day6` | готово |
 | 7 | — | `day7` | — |
 
 Названия дней 3-7 заполняются по мере получения заданий.

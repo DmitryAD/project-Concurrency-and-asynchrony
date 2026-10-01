@@ -22,18 +22,25 @@ aiohttp. Серверы сами считают:
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import socket
+import sqlite3
 import sys
+import tempfile
 import threading
 import time
 import traceback
 from collections import Counter, defaultdict
+from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 
 from crawler import (
-    AsyncCrawler, CircuitBreaker, CrawlerQueue, HTMLParser, RetryStrategy, RobotsParser,
+    AsyncCrawler, CircuitBreaker, CrawlerQueue, CSVStorage, HTMLParser, JSONStorage,
+    RetryStrategy, RobotsParser, SQLiteStorage,
 )
+from crawler.storage import STANDARD_FIELDS
 from crawler.errors import (
     CircuitOpenError, NetworkError, ParseError, PermanentError, RateLimitedError,
     TransientError, classify_exception, classify_status,
@@ -904,6 +911,179 @@ async def _(B, B2):
     assert r["errors_by_type"] == {"TransientError": 3, "PermanentError": 1}, r
     assert r["total_retries"] == 2 and r["successful_retries"] == 1, r
     assert r["failed_after_retries"] == 1 and abs(r["avg_retry_delay"] - 0.1) < 1e-9, r
+
+
+# ---------- День 6 ----------
+
+TRICKY = 'Цена: 12,990 ₽; "скидка" 10%\nвторая строка; запятая, кавычка " и табуляция\t'
+
+RECORDS = [
+    {"url": "https://s.test/1", "title": TRICKY, "text": "текст страницы",
+     "links": ["https://s.test/2", "https://other.test/"],
+     "metadata": {"description": "описание, с запятой"}, "status_code": 200,
+     "content_type": "text/html; charset=utf-8"},
+    {"url": "https://s.test/2", "title": "Вторая", "text": "", "links": [], "metadata": {},
+     "status_code": 200, "content_type": "text/html"},
+    {"url": "https://s.test/3", "title": "Третья", "text": "x" * 5000, "links": ["https://s.test/1"],
+     "metadata": {"keywords": "a, b"}, "status_code": 301, "content_type": None},
+]
+
+
+def tmpdir() -> Path:
+    return Path(tempfile.mkdtemp(prefix="crawler_check_"))
+
+
+def same_records(back: list[dict]) -> None:
+    """Прочитанное совпадает с записанным по всем значимым полям."""
+    assert len(back) == len(RECORDS), f"записей {len(back)}, ожидали {len(RECORDS)}"
+    for orig, got in zip(RECORDS, back):
+        for key in ("url", "title", "text", "links", "metadata", "status_code"):
+            assert got[key] == orig[key], f"{orig['url']}: поле {key} не совпало: {got[key]!r}"
+        datetime.fromisoformat(got["crawled_at"])     # дата читается обратно
+
+
+async def save_all(storage, records=RECORDS) -> None:
+    for r in records:
+        await storage.save(r)
+    await storage.close()
+
+
+@check("День 6", "JSON Lines: запись и чтение без потерь")
+async def _(B, B2):
+    path = tmpdir() / "r.jsonl"
+    await save_all(JSONStorage(path, batch_size=2))
+    lines = path.read_text(encoding="utf-8").splitlines()
+    assert len(lines) == 3, f"строк в файле {len(lines)}, ожидали 3 — по одной на запись"
+    same_records(await JSONStorage(path).read_all())
+
+
+@check("День 6", "JSON pretty: валидный массив с отступами, даже пустой")
+async def _(B, B2):
+    d = tmpdir()
+    await save_all(JSONStorage(d / "r.json", pretty=True, batch_size=2))
+    text = (d / "r.json").read_text(encoding="utf-8")
+    assert text.startswith("[") and "\n  {" in text, text[:80]
+    same_records(json.loads(text))
+    await JSONStorage(d / "empty.json", pretty=True).close()
+    assert json.loads((d / "empty.json").read_text(encoding="utf-8")) == []
+
+
+@check("День 6", "CSV: заголовки, спецсимволы, кодировки")
+async def _(B, B2):
+    d = tmpdir()
+    await save_all(CSVStorage(d / "r.csv", batch_size=2))
+    header = (d / "r.csv").read_text(encoding="utf-8").split("\n", 1)[0]
+    assert header.split(",") == list(STANDARD_FIELDS), header
+    same_records(await CSVStorage(d / "r.csv").read_all())
+
+    await save_all(CSVStorage(d / "bom.csv", encoding="utf-8-sig"))
+    assert (d / "bom.csv").read_bytes()[:3] == b"\xef\xbb\xbf", "нет метки BOM для Excel"
+
+    cyr = [{"url": "https://s.test/ru", "title": "Кофемашина, «Делонги»", "text": "привет",
+            "links": [], "metadata": {}, "status_code": 200}]
+    await save_all(CSVStorage(d / "cp.csv", encoding="cp1251"), cyr)
+    assert "Кофемашина".encode("cp1251") in (d / "cp.csv").read_bytes()
+    back = await CSVStorage(d / "cp.csv", encoding="cp1251").read_all()
+    assert back[0]["title"] == "Кофемашина, «Делонги»", back[0]["title"]
+
+
+@check("День 6", "SQLite: таблица, индексы, повтор URL не дублирует строку")
+async def _(B, B2):
+    path = tmpdir() / "r.db"
+    await save_all(SQLiteStorage(path, batch_size=2))
+    same_records(await SQLiteStorage(path).read_all())
+
+    con = sqlite3.connect(path)
+    indexes = {r[0] for r in con.execute("SELECT name FROM sqlite_master WHERE type='index'")}
+    assert {"idx_pages_crawled_at", "idx_pages_status"} <= indexes, indexes
+    con.close()
+
+    st = SQLiteStorage(path)
+    await save_all(st, [dict(RECORDS[0], title="Новый заголовок")])
+    rows = await SQLiteStorage(path).query("SELECT title FROM pages WHERE url = ?", (RECORDS[0]["url"],))
+    assert rows == [{"title": "Новый заголовок"}], rows
+
+
+@check("День 6", "пакетная запись: 25 записей, batch_size=10 → 3 пачки")
+async def _(B, B2):
+    st = SQLiteStorage(tmpdir() / "b.db", batch_size=10)
+    for i in range(25):
+        await st.save({"url": f"https://s.test/{i}", "title": str(i)})
+    assert st.batches == 2 and st.get_stats()["buffered"] == 5, st.get_stats()
+    await st.close()
+    assert st.batches == 3 and st.saved == 25, st.get_stats()
+    rows = await SQLiteStorage(st.path).query("SELECT COUNT(*) AS n FROM pages")
+    assert rows == [{"n": 25}], rows
+
+
+@check("День 6", "ошибка записи: повторы, лог, работа продолжается")
+async def _(B, B2):
+    d = tmpdir()
+    (d / "taken").mkdir()                 # на месте файла — папка: записать нельзя
+    st = JSONStorage(d / "taken", write_retries=2, retry_delay=0.01)
+    await save_all(st)                    # не должно бросить исключение
+    stats = st.get_stats()
+    assert stats["saved"] == 0 and stats["failed"] == 3, stats
+    assert stats["write_errors"] == 3, f"попыток записи {stats['write_errors']}, ожидали 1 + 2 повтора"
+
+
+@check("День 6", "временная ошибка записи: успех после повтора")
+async def _(B, B2):
+    class FlakyJSON(JSONStorage):
+        calls = 0
+
+        async def _write_batch(self, records):
+            FlakyJSON.calls += 1
+            if FlakyJSON.calls == 1:
+                raise OSError("диск занят")
+            await super()._write_batch(records)
+
+    path = tmpdir() / "flaky.jsonl"
+    st = FlakyJSON(path, retry_delay=0.01)
+    await save_all(st)
+    assert st.saved == 3 and st.failed == 0 and st.write_errors == 1, st.get_stats()
+    same_records(await JSONStorage(path).read_all())
+
+
+@check("День 6", "fetch_and_parse отдаёт код ответа и тип содержимого")
+async def _(B, B2):
+    c = AsyncCrawler()
+    try:
+        ok = await c.fetch_and_parse(f"{B}/parse")
+        bad = await c.fetch_and_parse(f"{B}/status/404")
+    finally:
+        await c.close()
+    assert ok["status_code"] == 200 and ok["content_type"].startswith("text/html"), ok
+    assert bad["status_code"] == 404 and set(ok) == set(bad)
+
+
+@check("День 6", "обход сохраняет каждую страницу в базу")
+async def _(B, B2):
+    path = tmpdir() / "crawl.db"
+    c = AsyncCrawler(max_depth=5, storage=SQLiteStorage(path, batch_size=4))
+    try:
+        res = await c.crawl([f"{B}/site/"], same_domain_only=True)
+    finally:
+        await c.close()                   # close() обязан дописать буфер
+    rows = await SQLiteStorage(path).read_all()
+    assert {r["url"] for r in rows} == set(res), (len(rows), len(res))
+    assert len(rows) == 9, len(rows)
+    assert all(r["status_code"] == 200 and r["content_type"].startswith("text/html") for r in rows)
+    assert all(datetime.fromisoformat(r["crawled_at"]) for r in rows)
+
+
+@check("День 6", "сломанное хранилище не останавливает обход")
+async def _(B, B2):
+    d = tmpdir()
+    (d / "taken").mkdir()
+    st = JSONStorage(d / "taken", batch_size=3, write_retries=1, retry_delay=0.01)
+    c = AsyncCrawler(max_depth=5, storage=st)
+    try:
+        res = await c.crawl([f"{B}/site/"], same_domain_only=True)
+    finally:
+        await c.close()
+    assert len(res) == 9, f"обработано {len(res)} страниц, ожидали 9"
+    assert st.failed == 9 and st.saved == 0, st.get_stats()
 
 
 # ============================================================

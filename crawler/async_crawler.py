@@ -9,6 +9,7 @@
          паузы, User-Agent. По умолчанию всё выключено — поведение
          дней 1-3 не меняется, пока не включишь явно.
 День 5 — классификация ошибок, автоматические повторы, circuit breaker.
+День 6 — сохранение результатов в JSON, CSV или SQLite (параметр storage).
          Тоже выключено по умолчанию: без retry_strategy каждый URL
          запрашивается ровно один раз, как в днях 1-4.
 
@@ -43,6 +44,7 @@ from crawler.rate_limiter import RateLimiter
 from crawler.retry_strategy import RetryStrategy
 from crawler.robots_parser import RobotsParser
 from crawler.semaphore_manager import SemaphoreManager
+from crawler.storage import DataStorage
 
 # Логгер по имени модуля. Сам по себе ничего не печатает, пока
 # приложение не настроит handler'ы — стандартная практика для библиотек.
@@ -101,6 +103,7 @@ class AsyncCrawler:
         user_agents: list[str] | None = None,
         retry_strategy: RetryStrategy | None = None,
         circuit_breaker: CircuitBreaker | None = None,
+        storage: DataStorage | None = None,
     ) -> None:
         """
         max_concurrent — сколько запросов летит одновременно всего.
@@ -144,6 +147,10 @@ class AsyncCrawler:
         День 5 (выключено по умолчанию):
         retry_strategy — правила повторов при ошибках. None — без
             повторов, каждый URL запрашивается один раз.
+        storage — день 6. Куда сохранять разобранные страницы: JSONStorage,
+            CSVStorage, SQLiteStorage. None — ничего не сохранять.
+            Хранилище закрывается вместе с краулером в close().
+
         circuit_breaker — автомат, временно блокирующий домен, который
             подряд отвечает ошибками. None — без автомата.
         """
@@ -205,6 +212,10 @@ class AsyncCrawler:
         self.error_details: dict[str, dict] = {}     # url -> тип, код, попытки
         self.error_counts: Counter = Counter()       # итоговые ошибки по типам
 
+        # День 6: сохранение и сведения об ответах.
+        self.storage = storage
+        self.response_info: dict[str, dict] = {}     # url -> код ответа и тип содержимого
+
     # ---------- сессия ----------
 
     def _ensure_session(self) -> aiohttp.ClientSession:
@@ -222,7 +233,15 @@ class AsyncCrawler:
         return self._session
 
     async def close(self) -> None:
-        """Закрывает сессию и освобождает соединения пула."""
+        """
+        Закрывает сессию и освобождает соединения пула.
+
+        День 6: заодно дописывает буфер хранилища и закрывает его.
+        Без этого последние несколько записей остались бы в памяти
+        и пропали.
+        """
+        if self.storage is not None:
+            await self.storage.close()
         if self._session is not None and not self._session.closed:
             await self._session.close()
             logger.debug("Сессия закрыта")
@@ -319,6 +338,11 @@ class AsyncCrawler:
             try:
                 async with session.get(url, **extra) as response:
                     # Превращает HTTP 4xx/5xx в ClientResponseError.
+                    # День 6: код ответа и тип содержимого — для сохранения
+                    self.response_info[url] = {
+                        "status_code": response.status,
+                        "content_type": response.headers.get("Content-Type"),
+                    }
                     response.raise_for_status()
                     html = await response.text()
 
@@ -489,6 +513,7 @@ class AsyncCrawler:
                 "parse_errors": [],
                 "error": ("запрещено robots.txt" if url in self.blocked_urls
                           else self.errors.get(url, "не удалось загрузить")),
+                **self._response_fields(url),
             }
 
         try:
@@ -500,13 +525,28 @@ class AsyncCrawler:
             self._record_error(url, err.reason, err)
             return {"url": url, "title": "", "text": "", "links": [], "metadata": {},
                     "images": [], "headings": {}, "tables": [], "lists": [],
-                    "parse_errors": [err.reason], "error": err.reason}
+                    "parse_errors": [err.reason], "error": err.reason,
+                    **self._response_fields(url)}
 
         if result["parse_errors"]:
             # Разобрали частично — это не провал, но учесть стоит
             self.error_counts["ParseError (частично)"] += 1
         result["error"] = None
+        result.update(self._response_fields(url))
+
+        # День 6: автоматическое сохранение после обработки страницы.
+        # save() не бросает исключений: ошибка записи не остановит обход.
+        if self.storage is not None:
+            await self.storage.save(result)
         return result
+
+    def _response_fields(self, url: str) -> dict:
+        """Код ответа и тип содержимого, если запрос дошёл до сервера."""
+        info = self.response_info.get(url, {})
+        status = info.get("status_code")
+        if status is None and url in self.error_details:
+            status = self.error_details[url].get("status")
+        return {"status_code": status, "content_type": info.get("content_type")}
 
     # ---------- день 3: обход сайта ----------
 
@@ -654,6 +694,9 @@ class AsyncCrawler:
             await asyncio.gather(*workers, return_exceptions=True)
             reporter.cancel()
             self.queue_stats = queue.get_stats()
+            # День 6: всё накопленное в буфере — на диск сразу после обхода
+            if self.storage is not None:
+                await self.storage.flush()
             self._log_progress(queue, started, final=True)
 
         return self.processed_urls
