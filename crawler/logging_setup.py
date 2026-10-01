@@ -1,25 +1,19 @@
 """
 День 7, пункт 6 — логирование в файл и консоль.
 
-До сих пор каждое демо настраивало logging.basicConfig у себя.
-Здесь — одна функция для всего приложения:
+Одна функция настройки для всего приложения вместо basicConfig в каждом демо:
 
     setup_logging(level="DEBUG", console_level="WARNING",
                   log_file="output/crawler.log")
 
-Что получается:
+    консоль — только WARNING и выше, чтобы не мешать прогресс-бару;
+    файл    — всё с DEBUG, время до миллисекунд.
 
-    консоль  — только важное (WARNING и выше), чтобы не мешать
-               прогресс-бару;
-    файл     — всё подробно (DEBUG и выше), с временем до миллисекунд.
+Ротация: дорос до max_bytes — файл становится crawler.log.1, старый .1 —
+.2 и т. д., хранится backup_count старых, самый старый удаляется.
 
-Ротация: когда файл дорастает до max_bytes, он переименовывается
-в crawler.log.1, старый .1 — в .2 и так далее; хранится backup_count
-старых файлов, самый старый удаляется. Иначе лог долгого краулера
-однажды съест весь диск.
-
-Формат text — для чтения глазами, json — по записи на строку,
-для машинной обработки (поиск, фильтры, загрузка в pandas).
+Формат text — для чтения глазами, json — запись на строку для разбора
+программой (поиск, фильтры, pandas).
 """
 
 from __future__ import annotations
@@ -33,8 +27,7 @@ from pathlib import Path
 TEXT_FORMAT = "%(asctime)s.%(msecs)03d | %(levelname)-7s | %(name)-22s | %(message)s"
 DATE_FORMAT = "%Y-%m-%d %H:%M:%S"
 
-# Метка на наших обработчиках: повторный вызов setup_logging
-# заменяет их, не трогая чужие и не удваивая вывод.
+# метка своих обработчиков: повторный вызов заменяет их, не трогая чужие
 _MARK = "_crawler_handler"
 
 
@@ -76,7 +69,7 @@ def setup_logging(
     console_level = (console_level or level).upper()
     root = logging.getLogger()
 
-    # Убрать то, что мы ставили раньше
+    # снять обработчики, поставленные раньше
     for handler in list(root.handlers):
         if getattr(handler, _MARK, False):
             root.removeHandler(handler)
@@ -103,8 +96,7 @@ def setup_logging(
         root.addHandler(file_handler)
         lowest = min(lowest, logging.getLevelName(level))
 
-    # Корневой логгер пропускает всё, что нужно хоть одному обработчику;
-    # дальше каждый обработчик фильтрует по своему уровню.
+    # корень пропускает всё, что нужно хоть одному обработчику, дальше фильтр по их уровням
     root.setLevel(lowest)
 
     if quiet_libraries:

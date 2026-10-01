@@ -1,9 +1,8 @@
 """
 День 2. Парсинг HTML и извлечение структурированных данных.
 
-Класс HTMLParser не ходит в сеть. Он получает готовую строку с HTML
-и превращает её в словарь с данными. Разделение намеренное: загрузка —
-дело AsyncCrawler, разбор — дело этого класса.
+HTMLParser в сеть не ходит: получает готовый HTML и возвращает словарь
+с данными. Загрузка — задача AsyncCrawler, разбор — этого класса.
 """
 
 from __future__ import annotations
@@ -28,8 +27,7 @@ SKIP_SCHEMES = {"mailto", "tel", "javascript", "data", "about"}
 NON_CONTENT_TAGS = ("script", "style", "noscript", "template")
 _SKIP_TAGS = frozenset(NON_CONTENT_TAGS)
 
-# Какие строки считаются текстом. Комментарии, DOCTYPE и содержимое
-# <script>/<style> BeautifulSoup помечает другими типами — они не войдут.
+# комментарии, DOCTYPE и script/style у BeautifulSoup других типов и в текст не попадут
 _TEXT_TYPES = (NavigableString, CData, TemplateString)
 
 
@@ -47,12 +45,10 @@ class HTMLParser:
         same_domain_only: bool = False,
     ) -> None:
         """
-        parser — движок разбора: "lxml" быстрее, "html.parser" всегда
-        доступен без внешних зависимостей. Если lxml не установлен,
-        молча переключаемся на встроенный.
-
-        same_domain_only — пункт 4 задания, необязательная фильтрация
-        внешних ссылок. По умолчанию выключена.
+        parser — движок разбора: "lxml" быстрее, "html.parser" есть всегда.
+            Если lxml не установлен, переключаюсь на встроенный.
+        same_domain_only — пункт 4, необязательная фильтрация внешних ссылок.
+            По умолчанию выключена.
         """
         self.parser = self._resolve_parser(parser)
         self.same_domain_only = same_domain_only
@@ -73,14 +69,11 @@ class HTMLParser:
         """
         Разбирает HTML и возвращает словарь со всеми извлечёнными данными.
 
-        Метод объявлен async, потому что так требует задание и потому что
-        так его удобно вызывать из асинхронного кода. Но внутри ничего
-        асинхронного нет: разбор HTML — вычислительная работа, а не
-        ожидание ввода-вывода.
+        async — по заданию и для удобства вызова из асинхронного кода, хотя
+        внутри только вычисления, без ожидания ввода-вывода.
 
-        Пункт 6 задания: сбой одного извлечения не отменяет остальные.
-        Каждый блок обёрнут отдельно, ошибки копятся в parse_errors,
-        а на выходе получается частичный, но валидный результат.
+        Пункт 6: каждое извлечение в своём try, ошибки копятся в parse_errors,
+        и при сбое одного блока остальные всё равно возвращаются.
         """
         result: dict = {
             "url": url,
@@ -95,10 +88,7 @@ class HTMLParser:
             "parse_errors": [],
         }
 
-        # BeautifulSoup крайне снисходителен к битому HTML: незакрытые
-        # теги, перепутанная вложенность, мусор вместо разметки — он всё
-        # равно построит дерево. Поэтому исключение здесь маловероятно,
-        # но если оно случится, дальше идти уже не с чем.
+        # BeautifulSoup строит дерево почти из любого мусора; если всё же упал — дальше не с чем
         try:
             soup = BeautifulSoup(html, self.parser)
         except Exception as e:  # noqa: BLE001
@@ -106,8 +96,7 @@ class HTMLParser:
             result["parse_errors"].append(f"BeautifulSoup: {type(e).__name__}: {e}")
             return result
 
-        # Каждое извлечение — отдельная попытка. Упало одно,
-        # остальные всё равно отработают.
+        # каждое извлечение отдельно: падение одного не мешает остальным
         extractors = (
             ("metadata", lambda: self.extract_metadata(soup)),
             ("text", lambda: self.extract_text(soup)),
@@ -138,10 +127,10 @@ class HTMLParser:
 
     def extract_links(self, soup: BeautifulSoup, base_url: str) -> list[str]:
         """
-        Собирает все ссылки со страницы и приводит их к абсолютному виду.
+        Все ссылки страницы в абсолютном виде.
 
-        Пункт 4 задания целиком: конвертация относительных ссылок,
-        валидация и необязательная фильтрация внешних.
+        Пункт 4: конвертация относительных ссылок, валидация и необязательная
+        фильтрация внешних.
         """
         base_domain = urlparse(base_url).netloc
         links: list[str] = []
@@ -152,19 +141,15 @@ class HTMLParser:
             if not href:
                 continue
 
-            # Отсекаем то, что не является страницей:
-            # mailto:, tel:, javascript: и якоря вида "#section"
+            # не страницы: mailto:, tel:, javascript: и якоря "#section"
             scheme = href.split(":", 1)[0].lower() if ":" in href else ""
             if scheme in SKIP_SCHEMES or href.startswith("#"):
                 continue
 
-            # urljoin — вся магия превращения относительной ссылки
-            # в абсолютную. Он знает правила: "/about" считается от корня
-            # сайта, "page2" — от текущей папки, "../up" — на уровень выше.
+            # "/about" — от корня, "page2" — от текущей папки, "../up" — уровнем выше
             absolute = urljoin(base_url, href)
 
-            # Отрезаем якорь: page#intro и page#outro — одна и та же
-            # страница, качать её дважды незачем
+            # page#intro и page#outro — одна страница
             absolute, _ = urldefrag(absolute)
 
             if not self._is_valid_url(absolute):
@@ -173,8 +158,7 @@ class HTMLParser:
             if self.same_domain_only and urlparse(absolute).netloc != base_domain:
                 continue
 
-            # Дедупликация с сохранением порядка: set быстро проверяет
-            # повтор, list хранит очерёдность
+            # без дублей, с сохранением порядка
             if absolute not in seen:
                 seen.add(absolute)
                 links.append(absolute)
@@ -211,19 +195,13 @@ class HTMLParser:
     @staticmethod
     def _clean_text(node) -> str:
         """
-        Выковыривает текст, предварительно выбросив служебные теги.
+        Текст узла без служебных тегов (<script>, <style> и т. п.) — иначе
+        в текст попадёт JS и CSS, а это бывает половина всех символов.
 
-        Без этого в «текст страницы» попадёт содержимое <script> —
-        то есть JavaScript-код, — и <style> с правилами CSS. На реальных
-        сайтах это легко половина всех символов.
-
-        День 7, оптимизация. Раньше здесь дерево превращалось обратно
-        в строку и разбиралось второй раз, медленным html.parser, чтобы
-        на копии удалить служебные теги. Замер показал: это 58% всего
-        времени разбора страницы. Теперь один проход по уже готовому
-        дереву, который просто не заходит внутрь служебных тегов.
-        Результат посимвольно тот же (проверено на 16 624 фрагментах),
-        а на странице в 70 КБ — 79 мс → 1.2 мс.
+        Оптимизация дня 7: раньше дерево превращалось обратно в строку и
+        разбиралось второй раз, чтобы удалить теги на копии, — 58% времени
+        всего разбора. Теперь один проход по готовому дереву без захода
+        в служебные теги. Результат тот же, на странице 70 КБ: 79 мс → 1.2 мс.
         """
         if isinstance(node, Tag) and node.name in _SKIP_TAGS:
             return ""
@@ -241,8 +219,7 @@ class HTMLParser:
                 if text:
                     parts.append(text)
 
-        # Пробел между кусками не даёт словам слипнуться на границе тегов:
-        # <b>при</b><i>вет</i> станет "при вет", а не "привет"
+        # пробел между кусками, иначе слова слипаются на границе тегов
         return " ".join(parts)
 
     # ---------- метаданные ----------
@@ -252,8 +229,7 @@ class HTMLParser:
         metadata: dict = {"title": "", "description": "", "keywords": ""}
 
         if soup.title and soup.title.string:
-            # split + join схлопывает переносы строк и лишние пробелы
-            # внутри заголовка: "Travel |\n    Books" -> "Travel | Books"
+            # "Travel |\n    Books" -> "Travel | Books"
             metadata["title"] = " ".join(soup.title.string.split())
 
         for name in ("description", "keywords"):
@@ -288,11 +264,8 @@ class HTMLParser:
 
     def extract_tables(self, soup: BeautifulSoup) -> list[list[list[str]]]:
         """
-        Таблицы страницы.
-
-        Каждая таблица — список строк, каждая строка — список ячеек.
-        Берём и th (заголовки), и td (данные): первая строка обычно
-        оказывается шапкой.
+        Таблицы страницы: список строк, строка — список ячеек.
+        Берутся и th, и td, поэтому первая строка обычно шапка.
         """
         tables: list[list[list[str]]] = []
         for table in soup.find_all("table"):
@@ -312,8 +285,7 @@ class HTMLParser:
         """Маркированные и нумерованные списки."""
         lists: list[list[str]] = []
         for tag in soup.find_all(["ul", "ol"]):
-            # recursive=False — берём только прямых потомков, иначе
-            # пункты вложенного списка попадут и во внешний тоже
+            # только прямые потомки, иначе вложенный список попадёт и во внешний
             items = [li.get_text(strip=True) for li in tag.find_all("li", recursive=False)]
             items = [i for i in items if i]
             if items:

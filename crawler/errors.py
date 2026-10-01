@@ -1,18 +1,12 @@
 """
 День 5. Классификация ошибок.
 
-Главный вопрос при любой ошибке: есть ли смысл попробовать ещё раз?
+Главное при ошибке — есть ли смысл повторять:
 
-    TransientError  — временная: сервер перегружен, таймаут, 503, 429.
-                      Через пару секунд может пройти — повторяем.
-    PermanentError  — постоянная: 404, 403, 401. Страницы нет или
-                      нас не пускают — повтор даст то же самое.
-    NetworkError    — сеть: соединение отклонено, DNS не нашёл домен.
-                      Иногда проходит со второго раза, повторяем осторожно.
-    ParseError      — не удалось разобрать ответ. Повтор бессмысленен:
-                      тот же HTML разберётся с той же ошибкой.
-
-Иерархия:
+    TransientError  — временная: перегрузка, таймаут, 503, 429. Повторяем.
+    PermanentError  — постоянная: 404, 403, 401. Повтор даст то же самое.
+    NetworkError    — соединение отклонено, DNS. Повторяем осторожно.
+    ParseError      — ответ не разобрался. Тот же HTML упадёт так же.
 
     CrawlerError
     ├── TransientError
@@ -81,10 +75,7 @@ TRANSIENT_STATUSES = {408, 425, 429, 500, 502, 503, 504}
 
 
 def parse_retry_after(value: str | None) -> float | None:
-    """
-    Заголовок Retry-After: число секунд. Бывает ещё дата, но её
-    почти не используют — такой вариант просто игнорируем.
-    """
+    """Retry-After в секундах. Вариант с датой почти не встречается — его игнорирую."""
     if not value:
         return None
     try:
@@ -107,8 +98,8 @@ def classify_exception(exc: BaseException, url: str = "") -> CrawlerError:
     """
     Любое исключение -> тип ошибки краулера.
 
-    Нужно, чтобы RetryStrategy понимала и «сырые» ошибки aiohttp,
-    если повторять через неё не краулер, а любую другую функцию.
+    Нужно, чтобы RetryStrategy понимала и сырые ошибки aiohttp, если
+    повторять через неё не краулер, а любую другую функцию.
     """
     if isinstance(exc, CrawlerError):
         return exc
@@ -116,8 +107,7 @@ def classify_exception(exc: BaseException, url: str = "") -> CrawlerError:
         headers = getattr(exc, "headers", None) or {}
         return classify_status(url, exc.status, f"ClientResponseError: HTTP {exc.status}",
                                headers.get("Retry-After"))
-    # Порядок важен: ServerTimeoutError — одновременно и сетевая ошибка,
-    # и таймаут. Таймаут проверяем раньше.
+    # ServerTimeoutError — и сетевая ошибка, и таймаут: таймаут проверяю первым
     if isinstance(exc, asyncio.TimeoutError):
         return TransientError(url, "TimeoutError: превышен таймаут")
     if isinstance(exc, aiohttp.ClientError):

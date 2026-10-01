@@ -27,11 +27,8 @@ def header(title: str) -> None:
     print(f"\n{'=' * 72}\n  {title}\n{'=' * 72}")
 
 
-# ============================================================
-# 1. Пример из задания
-# ============================================================
-
 async def demo_from_config() -> None:
+    """1. Пример из задания."""
     header("1. AdvancedCrawler.from_config('config.yaml') — books.toscrape.com")
     print("\n  Ниже — прогресс-бар. Он обновляется на месте, раз в полсекунды.\n")
 
@@ -62,11 +59,8 @@ async def demo_from_config() -> None:
     print(f"\n  HTML-отчёт: {OUT / 'report.html'} — открой в браузере")
 
 
-# ============================================================
-# 2. Sitemap
-# ============================================================
-
 async def demo_sitemap() -> None:
+    """2. Sitemap."""
     header("2. Sitemap: страницы из sitemap.xml как стартовые адреса")
     server1, B = start_server()
     server2, B2 = start_server()
@@ -102,11 +96,8 @@ async def demo_sitemap() -> None:
         print(f"    {url.replace(B, '')}: {info.get('reason')}")
 
 
-# ============================================================
-# 3. Что на диске
-# ============================================================
-
 async def demo_files() -> None:
+    """3. Что на диске."""
     header("3. Что осталось в output/day7/")
     print()
     for path in sorted(OUT.iterdir()):

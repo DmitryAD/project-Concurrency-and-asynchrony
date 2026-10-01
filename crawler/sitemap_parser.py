@@ -1,32 +1,27 @@
 """
 День 7, пункт 1 — sitemap.xml.
 
-Sitemap — это файл, в котором сайт сам перечисляет свои страницы.
-Вместо того чтобы искать их по ссылкам (день 3), можно взять
-готовый список. Два вида файла:
+В sitemap сайт сам перечисляет свои страницы, так что их можно взять
+готовым списком, а не искать по ссылкам. Бывает два вида.
 
-    Обычный sitemap — список страниц:
+Обычный — список страниц:
 
-        <urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
-          <url><loc>https://example.com/</loc></url>
-          <url><loc>https://example.com/about</loc></url>
-        </urlset>
+    <urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
+      <url><loc>https://example.com/</loc></url>
+      <url><loc>https://example.com/about</loc></url>
+    </urlset>
 
-    Индексный sitemap — список ДРУГИХ sitemap. У больших сайтов
-    страниц миллионы, а в один файл влезает не больше 50 000,
-    поэтому их делят на части:
+Индекс — список других sitemap. В один файл влезает не больше 50 000
+адресов, поэтому большие сайты делят их на части:
 
-        <sitemapindex xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
-          <sitemap><loc>https://example.com/sitemap-blog.xml</loc></sitemap>
-          <sitemap><loc>https://example.com/sitemap-shop.xml.gz</loc></sitemap>
-        </sitemapindex>
+    <sitemapindex xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
+      <sitemap><loc>https://example.com/sitemap-blog.xml</loc></sitemap>
+      <sitemap><loc>https://example.com/sitemap-shop.xml.gz</loc></sitemap>
+    </sitemapindex>
 
-Индекс разбираем рекурсивно: качаем каждую часть, а если часть сама
-оказалась индексом — спускаемся ещё глубже. Части качаются
-параллельно, через asyncio.gather.
-
-Где искать sitemap: в robots.txt есть строки «Sitemap: <адрес>»,
-а если их нет — по традиционному адресу /sitemap.xml.
+Индекс раскрывается рекурсивно, части качаются параллельно через
+asyncio.gather. Адрес sitemap берётся из строк «Sitemap:» в robots.txt,
+а если их нет — /sitemap.xml.
 """
 
 from __future__ import annotations
@@ -42,9 +37,7 @@ from crawler.robots_parser import RobotsParser
 
 logger = logging.getLogger(__name__)
 
-# Функция загрузки: адрес -> (HTTP-код, тело в байтах).
-# Подходит AsyncCrawler.fetch_bytes — тогда sitemap качается через
-# те же лимиты и тот же User-Agent, что и страницы.
+# адрес -> (HTTP-код, байты); AsyncCrawler.fetch_bytes даёт те же лимиты и User-Agent
 BytesFetcher = Callable[[str], Awaitable[tuple[int, bytes]]]
 
 # Первые два байта любого gzip-файла
@@ -52,7 +45,7 @@ GZIP_MAGIC = b"\x1f\x8b"
 
 
 def _local(tag: str) -> str:
-    """'{http://www.sitemaps.org/...}loc' -> 'loc'. Пространство имён нам не важно."""
+    """'{http://www.sitemaps.org/...}loc' -> 'loc', пространство имён не важно."""
     return tag.rsplit("}", 1)[-1]
 
 
@@ -146,25 +139,23 @@ class SitemapParser:
             logger.warning("Sitemap %s: %s", url, self.errors[url])
             return []
 
-        # Относительные адреса встречаются, хоть стандарт и запрещает
+        # относительные адреса встречаются, хоть стандарт и запрещает
         locs = [urljoin(url, loc) for loc in locs]
         locs = [u for u in locs if urlparse(u).scheme in ("http", "https")]
 
         if kind == "urlset":
             return locs
 
-        # Индекс: все вложенные sitemap — параллельно
+        # индекс: вложенные sitemap параллельно
         parts = await asyncio.gather(*(self._fetch(u, depth + 1) for u in locs))
         return [u for part in parts for u in part]
 
     @staticmethod
     def parse(body: bytes) -> tuple[str, list[str]]:
         """
-        Разбирает содержимое одного файла sitemap.
-
-        Возвращает (вид, адреса): вид — "urlset" или "sitemapindex".
-        Сжатый gzip распознаётся по первым байтам, а не по имени
-        файла: сервер может отдать .gz уже распакованным и наоборот.
+        Разбирает один файл sitemap, возвращает (вид, адреса), где вид —
+        "urlset" или "sitemapindex". Gzip узнаётся по первым байтам, а не по
+        имени: сервер может отдать .gz уже распакованным и наоборот.
         """
         if body[:2] == GZIP_MAGIC:
             body = gzip.decompress(body)

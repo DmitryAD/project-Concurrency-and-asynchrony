@@ -1,8 +1,7 @@
 """
 День 4. Разбор и соблюдение robots.txt.
 
-robots.txt — файл в корне сайта (site.com/robots.txt), где владелец
-пишет, куда роботам можно, а куда нельзя. Пример:
+robots.txt лежит в корне сайта и говорит роботам, куда можно, а куда нет:
 
     User-agent: *
     Disallow: /admin
@@ -12,19 +11,17 @@ robots.txt — файл в корне сайта (site.com/robots.txt), где �
     User-agent: BadBot
     Disallow: /
 
-Правила разбора — по стандарту RFC 9309:
-  - группы начинаются со строк User-agent; робот выбирает группу
-    с самым точным совпадением имени, иначе группу "*";
-  - из всех Allow/Disallow, подходящих под путь, побеждает САМОЕ
-    ДЛИННОЕ правило; при равной длине — Allow;
+Разбор по RFC 9309:
+  - группы начинаются со строк User-agent; берётся группа с самым
+    точным совпадением имени робота, иначе "*";
+  - из подходящих Allow/Disallow побеждает самое длинное правило,
+    при равной длине — Allow;
   - в правилах работают * (любые символы) и $ (конец адреса);
-  - нет файла (ответ 4xx) — можно всё;
-  - сервер недоступен (5xx, сетевая ошибка) — нельзя ничего:
-    раз не можем узнать правила, считаем, что всё запрещено;
+  - файла нет (4xx) — можно всё;
+  - сервер недоступен (5xx, сеть) — нельзя ничего;
   - сам /robots.txt разрешён всегда.
 
-Crawl-delay в стандарт не входит, но многие сайты его пишут,
-и вежливые роботы его соблюдают.
+Crawl-delay в стандарт не входит, но его часто пишут, поэтому соблюдаю.
 """
 
 from __future__ import annotations
@@ -37,8 +34,7 @@ from urllib.parse import urlparse
 
 logger = logging.getLogger(__name__)
 
-# Функция загрузки: получает адрес, возвращает (HTTP-код, текст).
-# Краулер передаёт свою, чтобы robots.txt шёл через его сессию.
+# адрес -> (HTTP-код, текст); краулер передаёт свою, чтобы идти через его сессию
 Fetcher = Callable[[str], Awaitable[tuple[int, str]]]
 
 
@@ -64,11 +60,11 @@ class RobotsParser:
 
     async def fetch_robots(self, base_url: str) -> dict:
         """
-        Загружает и разбирает robots.txt домена. Результат кэшируется:
-        для каждого домена файл скачивается ровно один раз.
+        Загружает и разбирает robots.txt домена, результат кэшируется:
+        файл скачивается один раз на домен.
 
-        Замок на домен нужен, потому что на новый домен разом могут прийти
-        десять воркеров. Без замка каждый скачал бы robots.txt сам.
+        Замок на домен — потому что на новый домен разом приходят несколько
+        воркеров, и без замка каждый скачал бы файл сам.
         """
         domain = self._domain(base_url)
         if domain in self._cache:
@@ -113,8 +109,8 @@ class RobotsParser:
 
     def parse(self, text: str, robots_url: str = "") -> dict:
         """
-        Разбирает текст robots.txt. Можно вызывать и без сети — удобно
-        для проверок. Результат кладётся в кэш для домена robots_url.
+        Разбирает текст robots.txt, сеть не нужна (удобно для проверок).
+        Результат кладётся в кэш для домена robots_url.
         """
         groups: dict[str, dict] = {}
         sitemaps: list[str] = []
@@ -129,8 +125,7 @@ class RobotsParser:
             field, value = field.strip().lower(), value.strip()
 
             if field == "user-agent":
-                # Несколько User-agent подряд — одна общая группа.
-                # User-agent после правил — начало новой группы.
+                # User-agent подряд — одна группа, после правил — новая
                 if not last_was_agent:
                     current_agents = []
                 agent = value.lower()
@@ -189,9 +184,8 @@ class RobotsParser:
         """
         Можно ли роботу user_agent запрашивать url.
 
-        Правила домена должны быть заранее загружены через fetch_robots
-        (или parse). Если их нет — отвечаем True: метод синхронный
-        и сходить за файлом сам не может.
+        Правила должны быть загружены заранее через fetch_robots (или parse).
+        Если их нет — True: метод синхронный и сам за файлом не сходит.
         """
         parts = urlparse(url)
         rules = self._cache.get(parts.netloc.lower())
@@ -216,18 +210,17 @@ class RobotsParser:
             for pattern in group[kind]:
                 if self._to_regex(pattern).match(target):
                     length = len(pattern)
-                    # Длиннее — сильнее. При равной длине Allow бьёт Disallow,
-                    # поэтому allow проверяем вторым и сравниваем через >=.
+                    # длиннее — сильнее; при равной длине Allow (проверяется вторым)
                     if length > best_len or (length == best_len and kind == "allow"):
                         best_len, allowed = length, (kind == "allow")
         return allowed
 
     def get_crawl_delay(self, user_agent: str = "*", url: str | None = None) -> float:
         """
-        Crawl-delay для робота, в секундах (0.0, если не задан).
+        Crawl-delay для робота в секундах (0.0, если не задан).
 
-        url — любой адрес на нужном домене. Если не указан, берётся
-        домен, чей robots.txt загружали последним.
+        url — любой адрес на нужном домене. Без него берётся домен,
+        чей robots.txt загружали последним.
         """
         domain = self._domain(url) if url else self._last_domain
         rules = self._cache.get(domain or "")

@@ -43,11 +43,8 @@ def size(path: Path) -> str:
     return f"{path.stat().st_size / 1024:.1f} КБ" if path.exists() else "нет файла"
 
 
-# ============================================================
-# 1-3. Обход, сохранение в три формата, чтение обратно
-# ============================================================
-
 async def demo_crawl_and_save() -> None:
+    """1-3. Обход, сохранение в три формата, чтение обратно."""
     header("1. Обход books.toscrape.com с сохранением в JSON, CSV и SQLite")
 
     for f in ("pages.jsonl", "pages.csv", "pages.db"):
@@ -124,11 +121,8 @@ async def demo_crawl_and_save() -> None:
     print("    pd.read_sql('SELECT * FROM pages', sqlite3.connect('output/day6/pages.db'))")
 
 
-# ============================================================
-# 4. Скорость: пачками против по одной
-# ============================================================
-
 async def demo_batch_speed() -> None:
+    """4. Скорость: пачками против по одной."""
     header("4. Скорость: 1000 записей в SQLite — по одной и пачками")
     records = [
         {"url": f"https://speed.test/{i}", "title": f"Страница {i}", "text": "x" * 500,
@@ -151,11 +145,8 @@ async def demo_batch_speed() -> None:
     print("    Пачками по 100 — 10. Разница обычно в разы, иногда в десятки раз.")
 
 
-# ============================================================
-# 5. Ошибка записи
-# ============================================================
-
 async def demo_storage_error() -> None:
+    """5. Ошибка записи."""
     header("5. Хранилище сломано, обход продолжается")
     broken = OUT / "broken_target"
     broken.mkdir(parents=True, exist_ok=True)     # на месте файла — папка

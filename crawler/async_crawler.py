@@ -1,26 +1,19 @@
 """
-Асинхронный HTTP-клиент.
+Асинхронный HTTP-клиент и обходчик.
 
 День 1 — загрузка страниц.
-День 2 — метод fetch_and_parse: загрузить и сразу разобрать.
-День 3 — метод crawl: обход сайта по ссылкам через очередь,
-         с ограничением глубины, фильтрами и лимитами на домен.
-День 4 — вежливость: ограничение частоты запросов, robots.txt,
-         паузы, User-Agent. По умолчанию всё выключено — поведение
-         дней 1-3 не меняется, пока не включишь явно.
-День 5 — классификация ошибок, автоматические повторы, circuit breaker.
-День 6 — сохранение результатов в JSON, CSV или SQLite (параметр storage).
-         Тоже выключено по умолчанию: без retry_strategy каждый URL
-         запрашивается ровно один раз, как в днях 1-4.
-День 7 — три небольших дополнения для AdvancedCrawler, поведение
-         дней 1-6 они не меняют:
-           fetch_bytes  — скачать файл как байты (sitemap.xml.gz);
-           on_page_done — «крючок»: вызывается после каждой страницы,
-                          так считается статистика;
-           snapshot()   — состояние обхода прямо сейчас, для прогресс-бара.
+День 2 — fetch_and_parse: загрузить и сразу разобрать.
+День 3 — crawl: обход по ссылкам через очередь, глубина, фильтры,
+         лимиты на домен.
+День 4 — вежливость: частота запросов, robots.txt, паузы, User-Agent.
+День 5 — классификация ошибок, повторы, circuit breaker.
+День 6 — сохранение в JSON, CSV или SQLite (параметр storage).
+День 7 — fetch_bytes (sitemap.xml.gz), крючок on_page_done для
+         статистики и snapshot() для прогресс-бара.
 
-Настройка логирования и запуск — в демо-скриптах: библиотека пишет
-в логгер, но не решает за приложение, куда и в каком формате выводить.
+Всё, что добавлялось после дня 3, по умолчанию выключено, так что
+код ранних дней работает как раньше. Вывод логов настраивает
+вызывающий код, сам модуль только пишет в свои логгеры.
 """
 
 from __future__ import annotations
@@ -53,12 +46,10 @@ from crawler.robots_parser import RobotsParser
 from crawler.semaphore_manager import SemaphoreManager
 from crawler.storage import DataStorage
 
-# Логгер по имени модуля. Сам по себе ничего не печатает, пока
-# приложение не настроит handler'ы — стандартная практика для библиотек.
+# сам по себе ничего не печатает, пока приложение не настроит handler'ы
 logger = logging.getLogger(__name__)
 
-# Отдельный логгер для прогресса, чтобы в демо можно было оставить
-# только его, приглушив построчные сообщения о каждой загрузке.
+# отдельно, чтобы в демо можно было оставить только прогресс
 progress_logger = logging.getLogger("crawler.progress")
 
 
@@ -114,98 +105,74 @@ class AsyncCrawler:
         on_page_done: Callable[[dict], None] | None = None,
     ) -> None:
         """
-        max_concurrent — сколько запросов летит одновременно всего.
+        max_concurrent — сколько запросов идёт одновременно всего.
+        connect/read/total_timeout — таймауты, с (день 1, пункт 7).
+        html_parser — свой экземпляр HTMLParser с другими настройками
+            (день 2). По умолчанию стандартный.
+        max_depth — глубина обхода (день 3): 0 — только стартовые,
+            1 — плюс ссылки с них, и так далее.
+        max_per_domain — запросов одновременно к одному сайту (день 3).
+            None — отдельного лимита нет, работает только max_concurrent.
+            Для чужих сайтов разумно 3-5.
+        progress_interval — как часто писать прогресс, с.
 
-        Таймауты вынесены в параметры, чтобы их можно было проверить
-        в демо (день 1, пункт 7: «протестировать таймауты»).
+        День 4, всё выключено по умолчанию:
+        requests_per_second — не чаще стольких запросов в секунду, None — без лимита.
+        rate_per_domain — True: лимит у каждого домена свой, False: общий.
+        min_delay — минимальная пауза между запросами, с.
+        jitter — случайная добавка к паузе, 0..jitter с.
+        error_backoff — замедление после 429, 5xx и таймаутов: пауза
+            удваивается с каждой ошибкой подряд, начиная с этого значения.
+        respect_robots — соблюдать robots.txt и Crawl-delay.
+        user_agent — как представляться сайтам; по нему же выбираются
+            правила robots.txt. None — заголовок aiohttp по умолчанию.
+        user_agents — список для ротации по кругу. robots.txt проверяется
+            для основного имени (user_agent или первого в списке).
 
-        html_parser — день 2. Свой экземпляр нужен, если хочешь другие
-        настройки разбора. Не передашь — создастся стандартный.
-
-        max_depth — день 3. Насколько далеко уходить от стартовой
-        страницы: 0 — только она сама, 1 — плюс страницы по ссылкам
-        с неё, 2 — плюс ссылки с тех страниц, и так далее.
-
-        max_per_domain — день 3. Сколько запросов одновременно
-        к одному сайту. None (по умолчанию) — отдельного лимита нет,
-        работает только max_concurrent, как в днях 1-2. Для вежливого
-        обхода чужих сайтов задавай явно, например 3-5.
-
-        progress_interval — раз в сколько секунд печатать прогресс.
-
-        День 4 (всё выключено по умолчанию):
-        requests_per_second — не чаще стольких запросов в секунду.
-            None — без ограничения.
-        rate_per_domain — True: лимит у каждого домена свой.
-            False: один лимит на все запросы.
-        min_delay — минимальная пауза между запросами, секунды.
-        jitter — случайная добавка к паузе, от 0 до jitter секунд.
-        error_backoff — замедление после ошибок сервера (429, 5xx,
-            таймауты): пауза растёт вдвое с каждой ошибкой подряд,
-            начиная с этого значения. 0 — выключено.
-        respect_robots — проверять robots.txt: не ходить туда,
-            где запрещено, и соблюдать Crawl-delay.
-        user_agent — как краулер представляется сайтам. По нему же
-            выбираются правила в robots.txt. None — стандартный
-            заголовок aiohttp.
-        user_agents — список для ротации: каждый запрос берёт
-            следующий по кругу. Правила robots.txt при этом всё
-            равно проверяются для основного имени — первого в списке.
-
-        День 5 (выключено по умолчанию):
-        retry_strategy — правила повторов при ошибках. None — без
-            повторов, каждый URL запрашивается один раз.
-        storage — день 6. Куда сохранять разобранные страницы: JSONStorage,
-            CSVStorage, SQLiteStorage. None — ничего не сохранять.
-            Хранилище закрывается вместе с краулером в close().
-
-        circuit_breaker — автомат, временно блокирующий домен, который
-            подряд отвечает ошибками. None — без автомата.
-
-        on_page_done — день 7. Функция, которую crawl() вызывает после
-            каждой обработанной страницы (и удачной, и нет) с её данными.
-            None — ничего не вызывается. Ошибка внутри функции обход
-            не останавливает, только пишется в лог.
+        retry_strategy — правила повторов (день 5). None — каждый URL
+            запрашивается один раз.
+        circuit_breaker — блокировка домена, который подряд отвечает
+            ошибками (день 5). None — без неё.
+        storage — куда сохранять страницы (день 6): JSONStorage, CSVStorage,
+            SQLiteStorage. Закрывается вместе с краулером в close().
+        on_page_done — функция, которую crawl() вызывает после каждой
+            страницы, удачной или нет (день 7). Её ошибка не останавливает
+            обход, а только пишется в лог.
         """
         self.max_concurrent = max_concurrent
         self.max_depth = max_depth
         self.progress_interval = progress_interval
         self.html_parser = html_parser or HTMLParser()
 
-        # ClientTimeout — несколько РАЗНЫХ таймаутов, и это не придирка:
-        #   connect   — сколько ждём установления соединения
-        #   sock_read — сколько ждём очередную порцию данных из сокета
-        #   total     — потолок на всю операцию целиком
+        # connect — установка соединения, sock_read — очередная порция данных, total — всё целиком
         self._timeout = aiohttp.ClientTimeout(
             connect=connect_timeout,
             sock_read=read_timeout,
             total=total_timeout,
         )
 
-        # Сессию создаём лениво, при первом обращении: она привязывается
-        # к работающему event loop, а __init__ вызывается до asyncio.run().
+        # сессия создаётся лениво: она привязана к event loop, а __init__ вызывается до asyncio.run()
         self._session: aiohttp.ClientSession | None = None
 
-        # День 3: вместо одного семафора — менеджер с двумя уровнями
-        # ограничений, глобальным и по доменам.
+        # день 3: два уровня ограничений — общий и по доменам
         self.semaphores = SemaphoreManager(
             max_concurrent=max_concurrent,
             max_per_domain=max_per_domain,
         )
 
-        # Счётчики для дней 1-2: статус запросов и причины ошибок.
+        # дни 1-2: статус запросов и причины ошибок
         self.successful: int = 0
         self.failed: int = 0
         self.errors: dict[str, str] = {}
 
-        # День 3, пункт 4: состояние обхода.
+        # день 3, пункт 4: состояние обхода
         self.visited_urls: set[str] = set()          # что уже качали
         self.failed_urls: dict[str, str] = {}        # url -> ошибка
         self.processed_urls: dict[str, dict] = {}    # url -> разобранные данные
         self.skipped_by_depth: int = 0
         self.queue_stats: dict = {}                  # итог очереди после crawl()
 
-        # День 4: вежливость.
+        # день 4: вежливость
         self.rate_limiter = RateLimiter(
             requests_per_second=requests_per_second,
             per_domain=rate_per_domain,
@@ -219,17 +186,17 @@ class AsyncCrawler:
         self._ua_cycle = itertools.cycle(user_agents) if user_agents else None
         self.blocked_urls: set[str] = set()          # запрещены robots.txt
 
-        # День 5: повторы и подробности об ошибках.
+        # день 5: повторы и подробности об ошибках
         self.retry_strategy = retry_strategy
         self.circuit_breaker = circuit_breaker
         self.error_details: dict[str, dict] = {}     # url -> тип, код, попытки
         self.error_counts: Counter = Counter()       # итоговые ошибки по типам
 
-        # День 6: сохранение и сведения об ответах.
+        # день 6: сохранение и сведения об ответах
         self.storage = storage
         self.response_info: dict[str, dict] = {}     # url -> код ответа и тип содержимого
 
-        # День 7: крючок для статистики и состояние текущего обхода.
+        # день 7: крючок для статистики и состояние текущего обхода
         self.on_page_done = on_page_done
         self._queue: CrawlerQueue | None = None
         self._crawl_started: float | None = None
@@ -240,9 +207,7 @@ class AsyncCrawler:
     def _ensure_session(self) -> aiohttp.ClientSession:
         """Создаёт сессию при первом обращении."""
         if self._session is None or self._session.closed:
-            # TCPConnector — это и есть connection pooling из дня 1.
-            # Соединения не закрываются после ответа, а складываются
-            # в пул и переиспользуются.
+            # TCPConnector — пул соединений: после ответа соединение возвращается в пул
             connector = aiohttp.TCPConnector(limit=self.max_concurrent)
             self._session = aiohttp.ClientSession(
                 connector=connector,
@@ -253,11 +218,8 @@ class AsyncCrawler:
 
     async def close(self) -> None:
         """
-        Закрывает сессию и освобождает соединения пула.
-
-        День 6: заодно дописывает буфер хранилища и закрывает его.
-        Без этого последние несколько записей остались бы в памяти
-        и пропали.
+        Закрывает сессию и пул соединений. Перед этим дописывает буфер
+        хранилища и закрывает его, иначе последние записи потерялись бы.
         """
         if self.storage is not None:
             await self.storage.close()
@@ -270,17 +232,13 @@ class AsyncCrawler:
 
     async def fetch_url(self, url: str) -> str | None:
         """
-        Загружает одну страницу.
+        Загружает одну страницу: HTML или None, если не удалось.
+        Исключения наружу не выходят (обещание дня 1).
 
-        Возвращает HTML или None, если запрос не удался. Исключения
-        наружу не пробрасываются — это обещание дня 1 остаётся в силе.
-
-        День 5: если задана retry_strategy, неудачные попытки
-        повторяются по её правилам. Причина окончательной неудачи
-        остаётся в self.errors, подробности — в self.error_details.
+        С retry_strategy неудачные попытки повторяются (день 5). Причина
+        итоговой неудачи — в self.errors, подробности — в self.error_details.
         """
-        # День 4: сначала robots.txt. Запрещённый адрес не занимает
-        # ни слот семафора, ни окно в лимите скорости, и не повторяется.
+        # сначала robots.txt: запрещённый адрес не занимает ни семафор, ни окно лимита
         if self.respect_robots and not await self._robots_allows(url):
             self._record_blocked(url)
             return None
@@ -300,8 +258,7 @@ class AsyncCrawler:
     async def _fetch_with_retries(self, url: str) -> str:
         """
         Повторы через RetryStrategy. Каждая следующая попытка получает
-        таймаут больше предыдущего (пункт 6): если сайт отвечает
-        медленно, ещё одна попытка с тем же таймаутом упадёт так же.
+        таймаут больше (пункт 6): медленный сайт с тем же таймаутом упадёт так же.
         """
         assert self.retry_strategy is not None
         attempt = 0
@@ -316,34 +273,33 @@ class AsyncCrawler:
 
     async def fetch_once(self, url: str, timeout_scale: float = 1.0) -> str:
         """
-        Ровно одна попытка загрузки. При неудаче БРОСАЕТ ошибку одного
-        из типов CrawlerError — TransientError, PermanentError,
-        NetworkError и т. д.
+        Ровно одна попытка загрузки; при неудаче бросает CrawlerError
+        (TransientError, PermanentError, NetworkError и т. д.).
 
-        Именно эту функцию можно передавать в RetryStrategy напрямую:
+        Эту функцию и надо отдавать в RetryStrategy:
 
             await strategy.execute_with_retry(crawler.fetch_once, url)
 
-        fetch_url для этого не подходит: он ошибки не бросает, а
-        возвращает None, и стратегия не поймёт, что нужно повторить.
+        fetch_url не подходит: он возвращает None вместо исключения,
+        и стратегия не узнает, что надо повторить.
 
         timeout_scale — во сколько раз увеличить таймауты этой попытки.
+
+        Порядок внутри: circuit breaker → семафоры → лимит скорости → запрос.
+        Лимит скорости стоит последним: если поставить его до семафора,
+        запрос получил бы разрешение, постоял бы за слотом и ушёл вплотную
+        к следующему.
         """
         session = self._ensure_session()
         domain = urlparse(url).netloc.lower()
 
-        # День 5: автомат-предохранитель. Если домен «выбит», запрос
-        # отклоняется сразу, не уходя в сеть.
+        # circuit breaker: заблокированный домен отклоняется без запроса в сеть
         if self.circuit_breaker is not None:
             self.circuit_breaker.check(domain, url)
 
-        # День 3: слот занимается сразу на двух уровнях — у домена
-        # и глобально. Подробности — в SemaphoreManager.acquire.
+        # слот домена и глобальный (см. SemaphoreManager.acquire)
         async with self.semaphores.acquire(url):
-            # День 4: лимит скорости — ПОСЛЕДНИЙ шаг перед отправкой.
-            # Если поставить его раньше семафора, запрос мог бы получить
-            # разрешение, потом постоять в очереди за слотом и уйти
-            # вплотную к следующему — лимит бы нарушался.
+            # лимит скорости — последний шаг перед отправкой (см. docstring)
             await self.rate_limiter.acquire(domain)
             logger.info("Начинаю загрузку %s", url)
 
@@ -356,8 +312,7 @@ class AsyncCrawler:
 
             try:
                 async with session.get(url, **extra) as response:
-                    # Превращает HTTP 4xx/5xx в ClientResponseError.
-                    # День 6: код ответа и тип содержимого — для сохранения
+                    # код и тип содержимого запоминаю до raise_for_status — для сохранения (день 6)
                     self.response_info[url] = {
                         "status_code": response.status,
                         "content_type": response.headers.get("Content-Type"),
@@ -365,20 +320,13 @@ class AsyncCrawler:
                     response.raise_for_status()
                     html = await response.text()
 
-            # ВАЖЕН ПОРЯДОК except — от частного к общему:
-            #
-            #   Exception
-            #   └── aiohttp.ClientError
-            #       ├── ClientResponseError     ← HTTP 404, 500...
-            #       └── ClientConnectionError
-            #           └── ServerTimeoutError  ← он же asyncio.TimeoutError
+            # except от частного к общему: ClientResponseError, таймаут, остальные ClientError
 
             except aiohttp.ClientResponseError as e:
                 headers = getattr(e, "headers", None) or {}
                 err = classify_status(url, e.status, f"ClientResponseError: HTTP {e.status}",
                                       headers.get("Retry-After"))
-                # 429 «слишком часто» и 5xx «серверу плохо» — сигнал
-                # притормозить. 404 — просто нет страницы, это не повод.
+                # 429 и 5xx — повод притормозить, 404 — нет
                 if isinstance(err, TransientError):
                     self._domain_failed(domain)
                 raise err from e
@@ -403,15 +351,12 @@ class AsyncCrawler:
 
     async def fetch_bytes(self, url: str) -> tuple[int, bytes]:
         """
-        День 7. Скачивает адрес как сырые байты и возвращает (код, тело).
+        Скачивает адрес как байты и возвращает (код, тело). День 7, для
+        sitemap: файл бывает в gzip, и text() его бы испортил.
 
-        Нужен для sitemap: файл бывает сжат gzip (sitemap.xml.gz),
-        а text() попытался бы прочитать сжатые байты как текст.
-
-        Идёт через те же лимиты, что и обычные страницы: семафоры,
-        лимит скорости, User-Agent. Код 4xx/5xx — НЕ исключение:
-        решать, что с ним делать, будет вызывающий. Сетевые ошибки
-        и таймауты пробрасываются как есть.
+        Идёт через те же семафоры, лимит скорости и User-Agent, что и страницы.
+        4xx/5xx не исключение — решает вызывающий. Сетевые ошибки и таймауты
+        пробрасываются как есть.
         """
         session = self._ensure_session()
         domain = urlparse(url).netloc.lower()
@@ -437,7 +382,7 @@ class AsyncCrawler:
         )
 
     def _record_error(self, url: str, reason: str, err: CrawlerError | None = None) -> None:
-        """Логировать ошибки с URL и типом ошибки."""
+        """Записывает ошибку с URL и типом и пишет её в лог."""
         self.failed += 1
         self.errors[url] = reason
         if err is not None:
@@ -473,8 +418,8 @@ class AsyncCrawler:
 
     async def _robots_allows(self, url: str) -> bool:
         """
-        Загружает robots.txt домена (один раз, дальше из кэша),
-        передаёт его Crawl-delay в лимитер и проверяет адрес.
+        Загружает robots.txt домена (один раз, дальше из кэша), передаёт
+        Crawl-delay в лимитер и проверяет адрес.
         """
         domain = urlparse(url).netloc.lower()
         await self.robots.fetch_robots(url)
@@ -484,7 +429,7 @@ class AsyncCrawler:
         return self.robots.can_fetch(url, self.user_agent or "*")
 
     async def _fetch_robots_text(self, url: str) -> tuple[int, str]:
-        """Загрузка самого robots.txt — через ту же сессию краулера."""
+        """Загрузка robots.txt через сессию краулера."""
         session = self._ensure_session()
         headers = {"User-Agent": self.user_agent} if self.user_agent else None
         async with session.get(url, headers=headers) as response:
@@ -532,10 +477,8 @@ class AsyncCrawler:
 
     async def fetch_and_parse(self, url: str) -> dict:
         """
-        Загружает страницу и сразу разбирает её.
-
-        Если загрузка не удалась, возвращается словарь той же формы,
-        но с пустыми полями и заполненным ключом error.
+        Загружает страницу и разбирает её. При неудаче — словарь той же
+        формы с пустыми полями и заполненным error.
         """
         html = await self.fetch_url(url)
 
@@ -559,8 +502,7 @@ class AsyncCrawler:
         try:
             result = await self.html_parser.parse_html(html, url)
         except Exception as e:  # noqa: BLE001
-            # День 5: ParseError. Не повторяем: тот же HTML разберётся
-            # с той же ошибкой.
+            # ParseError не повторяем: тот же HTML упадёт так же
             err = ParseError(url, f"ParseError: {type(e).__name__}: {e}")
             self._record_error(url, err.reason, err)
             return {"url": url, "title": "", "text": "", "links": [], "metadata": {},
@@ -569,13 +511,12 @@ class AsyncCrawler:
                     **self._response_fields(url)}
 
         if result["parse_errors"]:
-            # Разобрали частично — это не провал, но учесть стоит
+            # частичный разбор — не провал, но считаем
             self.error_counts["ParseError (частично)"] += 1
         result["error"] = None
         result.update(self._response_fields(url))
 
-        # День 6: автоматическое сохранение после обработки страницы.
-        # save() не бросает исключений: ошибка записи не остановит обход.
+        # save() не бросает исключений: ошибка записи не остановит обход
         if self.storage is not None:
             await self.storage.save(result)
         return result
@@ -599,12 +540,11 @@ class AsyncCrawler:
         include_patterns: list[str] | None = None,
     ) -> dict[str, dict]:
         """
-        Обходит сайт, начиная со start_urls и переходя по найденным ссылкам.
+        Обход от start_urls по найденным ссылкам.
 
-        Возвращает {url: разобранные данные} для успешно обработанных
-        страниц. Неудачи — в self.failed_urls.
+        Возвращает {url: данные} успешных страниц, неудачи — в self.failed_urls.
 
-        Устройство — классическая схема «очередь + воркеры»:
+        Схема «очередь + воркеры»:
 
             очередь URL  ←── найденные ссылки ───┐
                  │                               │
@@ -612,29 +552,29 @@ class AsyncCrawler:
                  ├──→ воркер 2 ─→ качает, разбирает
                  └──→ воркер N ─→ качает, разбирает
 
-        Воркеров столько же, сколько max_concurrent. Каждый в цикле
-        берёт URL из очереди, обрабатывает, кладёт найденные ссылки
-        обратно в очередь. Обход заканчивается, когда очередь пуста
-        И ни один воркер ничего не обрабатывает — иначе кто-то из них
-        ещё может добавить новые ссылки.
+        Воркеров max_concurrent. Обход заканчивается, когда очередь пуста
+        и ни один воркер ничего не обрабатывает — иначе кто-то ещё может
+        добавить ссылки.
 
-        Фильтры применяются к найденным ссылкам, стартовые URL
-        добавляются всегда:
+        Фильтры применяются к найденным ссылкам, стартовые URL идут всегда:
           same_domain_only  — только домены стартовых URL
           exclude_patterns  — регулярки; совпала хоть одна — пропускаем
-          include_patterns  — регулярки; если заданы, URL обязан
-                              совпасть хотя бы с одной
+          include_patterns  — регулярки; если заданы, URL должен совпасть с одной
+
+        Сессия здесь не создаётся: её откроет первый запрос. Иначе она
+        открывалась бы и там, где сеть не нужна, и aiohttp ругался бы
+        на незакрытую сессию.
+
+        Лимит страниц: между проверкой pages_started и его увеличением нет
+        ни одного await, поэтому гонки нет и воркеры не проскочат лимит.
+        По той же причине robots.txt (с await) проверяется до этого места.
         """
-        # Сессию здесь НЕ создаём: fetch_url создаст её сам при первом
-        # запросе. Иначе сессия откроется даже там, где сеть не нужна,
-        # и если её потом не закрыть, aiohttp напишет
-        # "Unclosed client session".
         queue = CrawlerQueue()
         start_domains = {urlparse(u).netloc.lower() for u in start_urls}
         exclude = [re.compile(p) for p in (exclude_patterns or [])]
         include = [re.compile(p) for p in (include_patterns or [])]
 
-        # Стартовые URL — глубина 0 и самый высокий приоритет
+        # стартовые URL — глубина 0 и наивысший приоритет
         for url in start_urls:
             queue.add_url(url, priority=self.max_depth + 1, depth=0)
 
@@ -647,9 +587,7 @@ class AsyncCrawler:
                 return False
             return True
 
-        # Счётчик взятых в работу страниц — для лимита max_pages.
-        # Гонки тут нет: всё происходит в одном потоке, а между проверкой
-        # и увеличением нет ни одного await, значит никто не вклинится.
+        # взятые в работу страницы — для max_pages (гонки нет, см. docstring)
         pages_started = 0
 
         async def worker() -> None:
@@ -660,10 +598,7 @@ class AsyncCrawler:
                 if url is None:           # сигнал «работы больше нет»
                     return
 
-                # День 4: запрещённое robots.txt не качаем и не тратим
-                # на него лимит страниц. Проверка стоит ДО подсчёта:
-                # между проверкой лимита и его увеличением ниже не должно
-                # быть ни одного await, иначе воркеры проскочат лимит.
+                # запрещённое robots.txt не качаем и не тратим на него лимит страниц
                 if self.respect_robots:
                     try:
                         allowed = await self._robots_allows(url)
@@ -674,8 +609,7 @@ class AsyncCrawler:
                         queue.mark_skipped(url)
                         continue
 
-                # Лимит страниц исчерпан — URL не качаем, просто
-                # отмечаем, чтобы очередь могла опустеть до конца.
+                # лимит исчерпан: только отметить, чтобы очередь опустела
                 if pages_started >= max_pages:
                     queue.mark_skipped(url)
                     continue
@@ -685,9 +619,7 @@ class AsyncCrawler:
                 depth = queue.get_depth(url)
                 self.visited_urls.add(url)
 
-                # На каждый URL — ровно одна отметка в очереди.
-                # try/except гарантирует это даже при неожиданной ошибке:
-                # без отметки queue.join() ждал бы вечно.
+                # ровно одна отметка на URL, иначе queue.join() ждал бы вечно
                 try:
                     data = await self.fetch_and_parse(url)
                     data["depth"] = depth
@@ -700,14 +632,11 @@ class AsyncCrawler:
 
                     self.processed_urls[url] = data
 
-                    # Новые ссылки добавляются ДО отметки о завершении.
-                    # Иначе очередь могла бы на мгновение показаться
-                    # пустой, и обход закончился бы раньше времени.
+                    # ссылки добавляю до отметки, иначе очередь на миг опустеет и обход закончится раньше
                     if depth < self.max_depth and pages_started < max_pages:
                         for link in data["links"]:
                             if should_follow(link):
-                                # Чем мельче глубина, тем выше приоритет:
-                                # сначала обходим ближние страницы.
+                                # ближние страницы раньше
                                 queue.add_url(
                                     link,
                                     priority=self.max_depth - depth,
@@ -759,9 +688,7 @@ class AsyncCrawler:
     def snapshot(self) -> dict:
         """
         Состояние обхода прямо сейчас — для прогресс-бара (день 7).
-
-        Ничего не меняет и не ждёт, поэтому его можно вызывать
-        из фоновой задачи сколько угодно часто.
+        Ничего не меняет и не ждёт, можно вызывать сколько угодно часто.
         """
         q = self._queue.get_stats() if self._queue is not None else {}
         done = q.get("processed", 0) + q.get("failed", 0)
@@ -783,10 +710,8 @@ class AsyncCrawler:
 
     async def _report_progress(self, queue: CrawlerQueue, started: float) -> None:
         """
-        Фоновая задача: раз в progress_interval секунд печатает прогресс.
-
-        Работает параллельно с воркерами — ещё одна корутина в том же
-        event loop. Отменяется, когда обход закончен.
+        Фоновая задача: раз в progress_interval секунд пишет прогресс.
+        Ещё одна корутина в том же event loop, отменяется в конце обхода.
         """
         while True:
             await asyncio.sleep(self.progress_interval)

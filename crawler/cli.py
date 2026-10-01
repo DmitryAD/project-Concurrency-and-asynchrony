@@ -3,16 +3,14 @@
 
     python -m crawler --urls https://example.com --max-pages 100 --output results.json
 
-Почему «python -m crawler», а не «python crawler.py», как в задании:
-у нас crawler — это папка-пакет. Файл crawler.py рядом с ней
-конфликтовал бы с ней по имени. Python для таких случаев умеет
-запускать сам пакет: «python -m crawler» выполняет crawler/__main__.py,
-а он вызывает main() отсюда. Параметры — те же, что в задании.
+В задании «python crawler.py», но crawler у меня — пакет, и файл
+crawler.py рядом конфликтовал бы с ним по имени. «python -m crawler»
+запускает crawler/__main__.py, который вызывает main() отсюда.
+Параметры те же, что в задании.
 
-Порядок приоритета настроек (каждый следующий перекрывает предыдущий):
-    значения по умолчанию  <  файл --config  <  параметры командной строки
+Приоритет: значения по умолчанию < файл --config < параметры командной строки.
+Например, всё в config.yaml, а одно значение — на лету:
 
-То есть можно держать всё в config.yaml и поменять одну вещь на лету:
     python -m crawler --config config.yaml --max-pages 10
 """
 
@@ -41,8 +39,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--output", metavar="ФАЙЛ",
                    help="куда сохранять страницы; формат по расширению: "
                         ".json, .jsonl, .csv, .db/.sqlite")
-    # BooleanOptionalAction даёт пару --respect-robots / --no-respect-robots:
-    # можно и включить, и выключить то, что задано в конфигурации.
+    # пара --respect-robots / --no-respect-robots: можно и включить, и выключить
     p.add_argument("--respect-robots", action=argparse.BooleanOptionalAction, default=None,
                    help="соблюдать robots.txt")
     p.add_argument("--rate-limit", type=float, metavar="RPS", help="не больше стольких запросов в секунду")
@@ -123,8 +120,8 @@ async def run(config: CrawlerConfig) -> dict:
 
 def main(argv: list[str] | None = None) -> int:
     """
-    Возвращает код выхода: 0 — обход завершён (отдельные неудачные страницы —
-    это нормально, они в статистике), 2 — неверные параметры, 130 — Ctrl+C.
+    Код выхода: 0 — обход завершён (неудачные страницы есть в статистике),
+    2 — неверные параметры, 130 — Ctrl+C.
     """
     parser = build_parser()
     args = parser.parse_args(argv)

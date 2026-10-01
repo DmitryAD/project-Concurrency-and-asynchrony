@@ -3,20 +3,16 @@
 
     python -m tests.check_all
 
-Зачем: каждый новый день меняет общий код в crawler/. Эта проверка
-ловит момент, когда новая логика незаметно сломала старую. Запускай
-её после КАЖДОГО изменения, а с появлением нового дня дописывай сюда
-его проверки.
+Каждый день меняет общий код в crawler/, поэтому после любой правки
+прогоняю все проверки сразу: так видно, если новая логика сломала старую.
 
-Интернет не нужен. Скрипт поднимает на твоём компьютере два маленьких
-HTTP-сервера (127.0.0.1, случайные порты) и гоняет по ним настоящий
-aiohttp. Серверы сами считают:
-  - сколько запросов пришло к ним одновременно (пик),
-  - сколько раз запросили каждую страницу.
-Так лимиты и отсутствие дублей проверяются со стороны сервера,
-а не по отчёту самого краулера.
+Сеть не нужна: скрипт поднимает два локальных HTTP-сервера (127.0.0.1,
+случайные порты) и гоняет по ним настоящий aiohttp. Серверы сами считают
+пик одновременных запросов и число обращений к каждой странице, так что
+лимиты и отсутствие дублей проверяются со стороны сервера, а не по
+отчёту краулера.
 
-Итог — список проверок с ✓/✗ и код выхода: 0, если прошло всё, 1 — если нет.
+Вывод — список проверок с ✓/✗, код выхода 0, если прошло всё, иначе 1.
 """
 
 from __future__ import annotations
@@ -54,19 +50,14 @@ from crawler.errors import (
 )
 
 
-# ============================================================
-# Локальный тестовый сайт
-# ============================================================
-
 def page(title: str, *links: str, extra: str = "") -> str:
+    """HTML-страница с заголовком и ссылками."""
     anchors = "".join(f'<a href="{link}">{link}</a>' for link in links)
     return (f"<html><head><title>{title}</title></head>"
             f"<body>{extra}{anchors}</body></html>")
 
 
-# Сайт для обхода (день 3). Внутри есть цикл (/a/2 → /), повторные
-# ссылки (/b → /a), несуществующая страница (/c) и служебный раздел.
-# Ссылку на «чужой домен» подставляем позже — это адрес второго сервера.
+# сайт для обхода (день 3): цикл /a/2 → /, повтор /b → /a, 404 на /c; EXTERNAL — второй сервер
 SITE = {
     "/site/": ["/site/a", "/site/b", "/site/c", "/site/private/login", "EXTERNAL", "/site/a"],
     "/site/a": ["/site/a/1", "/site/a/2", "/site/"],
@@ -80,7 +71,7 @@ SITE = {
     "/site/x": [],
 }
 
-# robots.txt тестового сайта (день 4). Раздаётся обоими серверами.
+# robots.txt тестового сайта (день 4), одинаковый на обоих серверах
 ROBOTS_TXT = """
 User-agent: *
 Disallow: /site/private
@@ -90,9 +81,7 @@ User-agent: BlockedBot
 Disallow: /
 """
 
-# День 7: sitemap. {B} заменяется адресом сервера при ответе.
-# Индекс ссылается на обычный sitemap, на сжатый gzip, на вложенный
-# индекс, на несуществующий файл и сам на себя (цикл).
+# sitemap (день 7): индекс → обычный, gzip, вложенный индекс, 404 и ссылка на себя (цикл)
 SITEMAPS = {
     "/sitemap.xml": ("index", ["/sitemaps/pages.xml", "/sitemaps/more.xml.gz",
                                "/sitemaps/nested.xml", "/sitemaps/missing.xml", "/sitemap.xml"]),
@@ -159,13 +148,20 @@ class Handler(BaseHTTPRequestHandler):
         pass
 
     def do_GET(self) -> None:
+        """
+        Отвечает на запрос и ведёт статистику.
+
+        /hang/N и /slowhang/N (таймауты) в активные не попадают: клиент
+        бросает такой запрос раньше, а сервер ещё досыпает, и этот хвост
+        испортил бы пик в следующей проверке. Обращения к ним считаются.
+
+        Счётчик активных уменьшается до отправки ответа. Иначе клиент
+        получает ответ, следующая проверка обнуляет статистику, а
+        уменьшение прилетает уже в неё.
+        """
         port = self.server.server_address[1]
         path = self.path.split("?", 1)[0]    # хвост ?n=1 не нужен для маршрута
 
-        # /hang/N и /slowhang/N — для проверок таймаута. Клиент может
-        # бросить такой запрос, а сервер ещё досыпает. Чтобы этот хвост
-        # не испортил подсчёт пиков в следующих проверках, в «активные»
-        # такие запросы не попадают. Число обращений при этом считаем.
         if path.startswith(("/hang/", "/slowhang/")):
             with STATS.lock:
                 STATS.hits[(port, path)] += 1
@@ -185,10 +181,7 @@ class Handler(BaseHTTPRequestHandler):
             STATS.peak[port] = max(STATS.peak[port], STATS.inflight[port])
             STATS.peak_total = max(STATS.peak_total, STATS.inflight_total)
 
-        # Сначала «работаем» и снимаемся с учёта, и только ПОТОМ отвечаем.
-        # Если ответить раньше, клиент получит ответ, следующая проверка
-        # успеет обнулить статистику, а наше уменьшение счётчика прилетит
-        # уже после — и испортит подсчёт пика в чужой проверке.
+        # сначала снимаемся с учёта, потом отвечаем (см. docstring)
         try:
             code, body, *rest = self._route(path)
             headers = rest[0] if rest else {}
@@ -214,11 +207,14 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(data)
 
     def _route(self, path: str) -> tuple:
-        """Готовит ответ: (код, тело) или (код, тело, заголовки)."""
+        """
+        Готовит ответ: (код, тело) или (код, тело, заголовки).
+
+        /flaky/<ключ>/<N>    — первые N раз 503, потом 200 (день 5)
+        /flaky429/<ключ>/<N> — то же с 429 и Retry-After: 1
+        """
         if path == "/ok":
             return 200, page("OK")
-        # День 5. /flaky/<ключ>/<N> — первые N раз отвечает 503, потом 200.
-        # /flaky429/<ключ>/<N> — то же с 429 и заголовком Retry-After: 1.
         if path.startswith(("/flaky/", "/flaky429/")):
             kind, key, n = path.strip("/").split("/")
             with STATS.lock:
@@ -238,8 +234,7 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/parse":
             return 200, PARSE_PAGE
         if path == "/robots.txt":
-            # День 7: строка Sitemap — для SitemapParser.discover.
-            # На правила доступа она не влияет.
+            # строка Sitemap нужна для SitemapParser.discover (день 7)
             base = f"http://127.0.0.1:{self.server.server_address[1]}"
             return 200, ROBOTS_TXT + f"\nSitemap: {base}/sitemaps/pages.xml\n"
         if path in SITEMAPS:
@@ -259,12 +254,15 @@ class Handler(BaseHTTPRequestHandler):
 
 
 class TestServer(ThreadingHTTPServer):
+    """
+    Многопоточный тестовый сервер.
+
+    request_queue_size по умолчанию 5: если краулер откроет 8 соединений
+    разом, лишние ядро отбросит, клиент повторит их через секунду, и
+    проверка покажет пик 6 вместо 8. 128 хватает с запасом.
+    """
+
     daemon_threads = True
-    # Очередь входящих подключений. По умолчанию в Python она на 5 мест:
-    # если краулер откроет 8 соединений разом, а сервер не успеет их
-    # принять, лишние ядро отбросит и клиент повторит их только через
-    # секунду. Тогда проверка лимита покажет пик 6 вместо 8 — ошибка
-    # теста, а не краулера. 128 мест хватит с запасом.
     request_queue_size = 128
 
 
@@ -281,9 +279,7 @@ def closed_port() -> int:
         return s.getsockname()[1]
 
 
-# ============================================================
 # Проверки
-# ============================================================
 
 CHECKS: list[tuple[str, str, object]] = []
 
@@ -619,8 +615,7 @@ async def _(B, B2):
     for port in (port_of(B), port_of(B2)):
         g = gaps(port)
         assert min(g) >= 0.5 - EPS, f"сервер {port}: паузы {[round(x, 3) for x in g]}"
-    # Лимиты независимы: два сайта по 3 запроса идут параллельно, ~1.0 c.
-    # Будь лимит общим, вышло бы ~2.5 c.
+    # лимиты независимые: ~1.0 c; с общим лимитом было бы ~2.5 c
     assert dt < 1.6, f"заняло {dt:.2f} c — похоже, лимит общий, а не по доменам"
 
 
@@ -678,8 +673,7 @@ async def _(B, B2):
     hits = {path: n for (port, path), n in STATS.hits.items() if port == port_of(B)}
     assert not any(p.startswith("/site/private") for p in hits), f"сервер получил: {sorted(hits)}"
     assert c.blocked_urls == {f"{B}/site/private/login"}, c.blocked_urls
-    # Запрет — не ошибка: адрес не должен попасть в failed_urls
-    # и тратить лимит страниц
+    # запрет robots.txt — не ошибка и не тратит лимит страниц
     assert f"{B}/site/private/login" not in c.failed_urls, c.failed_urls
     assert c.queue_stats["skipped"] >= 1, c.queue_stats
     assert hits.get("/robots.txt") == 1, f"robots.txt скачан {hits.get('/robots.txt')} раз, а надо 1"
@@ -891,8 +885,7 @@ async def _(B, B2):
 
 @check("День 5", "таймаут повторяется, и таймаут растёт с каждой попыткой")
 async def _(B, B2):
-    # Сервер думает 0.45 c, таймаут 0.3 c. Без роста все попытки упадут,
-    # с ростом в 2 раза вторая попытка (0.6 c) успеет.
+    # ответ через 0.45 c при таймауте 0.3 c: успеет только попытка с таймаутом ×2
     url = f"{B}/slowhang/0.45"
     STATS.reset()
     c = AsyncCrawler(total_timeout=0.3, retry_strategy=fast_retry(max_retries=2, timeout_growth=1.0))
@@ -1548,19 +1541,14 @@ async def _(B, B2):
     assert stats2["status_codes"] == {"200": 9, "404": 1}, stats2["status_codes"]
     hits = STATS.hits[(port_of(B), "/site/a")]
     assert hits == 2, f"/site/a запрошен {hits} раз: второй обход должен качать заново"
-    # Формат json (массив) — самый хрупкий: если между обходами хранилище
-    # закрыть, второй обход откроет файл заново и сотрёт первый
+    # json-массив перезаписался бы, если закрыть хранилище между обходами
     saved = json.loads((d / "p.json").read_text(encoding="utf-8"))
     assert len(saved) == 18, f"в файле {len(saved)} записей, ожидали 9 + 9"
     assert crawler.runs == 2, crawler.runs
 
 
-
-# ============================================================
-# Запуск
-# ============================================================
-
 async def run_all() -> int:
+    """Запуск."""
     server1, B = start_server()
     server2, B2 = start_server()
     Handler.external = f"{B2}/site/x"
