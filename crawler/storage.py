@@ -451,4 +451,4 @@ class MultiStorage(DataStorage):
         await asyncio.gather(*(s.close() for s in self.storages))
 
     def get_stats(self) -> dict:
-        return {"storage": "MultiStorage", "parts": [s.get_stats() for s in self.storages]}
+        return {"storage": "MultiStorage", "parts": [s.get_stats() for s in self.storages]} 
