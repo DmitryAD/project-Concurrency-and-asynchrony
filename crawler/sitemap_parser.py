@@ -180,4 +180,4 @@ async def _default_fetcher(url: str) -> tuple[int, bytes]:
     timeout = aiohttp.ClientTimeout(total=15)
     async with aiohttp.ClientSession(timeout=timeout) as session:
         async with session.get(url) as response:
-            return response.status, await response.read()
+            return response.status, await response.read() 
