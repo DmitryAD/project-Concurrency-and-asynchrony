@@ -101,11 +101,32 @@ class AdvancedCrawler:
                 fmt=cfg.logging.format,
             )
 
-        self.stats = CrawlerStats()
         self.storage = make_storage(cfg.storage)
+        self.progress_stream = progress_stream or sys.stderr
+        self.results: dict[str, dict] = {}
+        self.start_urls: list[str] = []
+        self.sitemap_urls: list[str] = []
+        self.runs = 0                       # сколько раз вызывали crawl()
+        self._storage_prepared = False
+        self._new_run()
 
+    def _new_run(self) -> None:
+        """
+        Свежие компоненты для очередного обхода: краулер, статистика, sitemap.
+
+        Хранилище НЕ пересоздаётся: оно одно на весь объект, и второй
+        обход дописывает в тот же файл или базу.
+        """
+        self.stats = CrawlerStats()
+        self.crawler = self._build_crawler()
+        # Sitemap качается через сам краулер: те же лимиты и User-Agent
+        self.sitemap_parser = SitemapParser(fetcher=self.crawler.fetch_bytes,
+                                            max_urls=self.config.limits.max_pages)
+
+    def _build_crawler(self) -> AsyncCrawler:
+        cfg = self.config
         c = cfg.crawler
-        self.crawler = AsyncCrawler(
+        return AsyncCrawler(
             max_concurrent=c.max_concurrent,
             max_per_domain=c.max_per_domain,
             connect_timeout=c.connect_timeout,
@@ -119,6 +140,7 @@ class AdvancedCrawler:
             error_backoff=c.error_backoff,
             respect_robots=c.respect_robots,
             user_agent=c.user_agent,
+            user_agents=c.user_agents or None,
             retry_strategy=(RetryStrategy(
                 max_retries=cfg.retry.max_retries,
                 backoff_factor=cfg.retry.backoff_factor,
@@ -132,14 +154,6 @@ class AdvancedCrawler:
             storage=self.storage,
             on_page_done=self._on_page_done,
         )
-        # Sitemap качается через сам краулер: те же лимиты и User-Agent
-        self.sitemap_parser = SitemapParser(fetcher=self.crawler.fetch_bytes,
-                                            max_urls=cfg.limits.max_pages)
-        self.progress_stream = progress_stream or sys.stderr
-        self.results: dict[str, dict] = {}
-        self.start_urls: list[str] = []
-        self.sitemap_urls: list[str] = []
-        self._storage_prepared = False
 
     @classmethod
     def from_config(cls, source: str | Path | CrawlerConfig | dict, **kwargs) -> "AdvancedCrawler":
@@ -160,8 +174,15 @@ class AdvancedCrawler:
         из конфигурации, плюс всё найденное в sitemap.
 
         Возвращает {url: данные страницы} для успешных страниц.
+
+        Каждый вызов — отдельный обход со своей статистикой: второй
+        вызов не прибавляет цифры к первому и заново качает страницы.
+        Хранилище общее: второй обход дописывает в тот же файл.
         """
         cfg = self.config
+        if self.runs > 0:
+            await self._restart()
+        self.runs += 1
         self._prepare_storage()
         self.stats.start()
 
@@ -219,6 +240,14 @@ class AdvancedCrawler:
         if sitemaps:
             logger.info("Из sitemap получено %d адресов", len(found))
         return found
+
+    async def _restart(self) -> None:
+        """Закрыть сессию прошлого обхода (но не хранилище) и собрать всё заново."""
+        old = self.crawler
+        old.storage = None              # иначе close() закрыл бы общее хранилище
+        await old.close()
+        self._new_run()
+        logger.info("Новый обход: статистика прошлого обнулена")
 
     def _on_page_done(self, data: dict) -> None:
         """Крючок AsyncCrawler: вызывается после каждой страницы."""

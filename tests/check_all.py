@@ -1503,6 +1503,59 @@ async def _(B, B2):
     assert dt < 30, f"500 страниц за {dt:.1f} c — подозрительно медленно"
 
 
+@check("День 7", "ротация User-Agent из конфигурации и CLI доходит до сервера")
+async def _(B, B2):
+    args = build_parser().parse_args(["--urls", f"{B}/ok", "--user-agents", "BotA/1.0", "BotB/1.0"])
+    assert config_from_args(args).crawler.user_agents == ["BotA/1.0", "BotB/1.0"], "--user-agents не применился"
+
+    STATS.reset()
+    config = CrawlerConfig.from_dict({
+        "start_urls": [f"{B}/ok?n={i}" for i in range(4)],
+        "limits": {"max_depth": 0},
+        "crawler": {"max_concurrent": 1, "user_agents": ["BotA/1.0", "BotB/1.0"]},
+        "progress": {"enabled": False},
+    })
+    crawler = AdvancedCrawler(config, configure_logging=False)
+    try:
+        await crawler.crawl()
+    finally:
+        await crawler.close()
+    assert STATS.user_agents == ["BotA/1.0", "BotB/1.0"] * 2, f"сервер видел: {STATS.user_agents}"
+
+
+@check("День 7", "повторный crawl() — новый обход: статистика не суммируется, хранилище дописывается")
+async def _(B, B2):
+    d = tmpdir()
+    STATS.reset()
+    config = CrawlerConfig.from_dict({
+        "start_urls": [f"{B}/site/"],
+        "limits": {"max_depth": 5},
+        "storage": {"type": "json", "path": str(d / "p.json"), "batch_size": 4},
+        "progress": {"enabled": False},
+    })
+    crawler = AdvancedCrawler(config, configure_logging=False)
+    try:
+        first = dict(await crawler.crawl())
+        stats1 = crawler.get_stats()
+        second = await crawler.crawl()
+        stats2 = crawler.get_stats()
+    finally:
+        await crawler.close()
+    for st in (stats1, stats2):
+        got = (st["total_pages"], st["successful"], st["failed"])
+        assert got == (10, 9, 1), f"обход {st is stats2 and 2 or 1}: {got} — статистика суммируется?"
+    assert len(first) == len(second) == 9, (len(first), len(second))
+    assert stats2["status_codes"] == {"200": 9, "404": 1}, stats2["status_codes"]
+    hits = STATS.hits[(port_of(B), "/site/a")]
+    assert hits == 2, f"/site/a запрошен {hits} раз: второй обход должен качать заново"
+    # Формат json (массив) — самый хрупкий: если между обходами хранилище
+    # закрыть, второй обход откроет файл заново и сотрёт первый
+    saved = json.loads((d / "p.json").read_text(encoding="utf-8"))
+    assert len(saved) == 18, f"в файле {len(saved)} записей, ожидали 9 + 9"
+    assert crawler.runs == 2, crawler.runs
+
+
+
 # ============================================================
 # Запуск
 # ============================================================

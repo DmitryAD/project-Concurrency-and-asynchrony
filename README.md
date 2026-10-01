@@ -137,6 +137,7 @@ python -m crawler --help
 | `--stats-json ФАЙЛ.json` | статистика в JSON |
 | `--log-file ФАЙЛ`, `--log-level LEVEL` | лог в файл с ротацией и его уровень |
 | `--user-agent СТРОКА` | как представляться сайтам |
+| `--user-agents СТРОКА [СТРОКА ...]` | несколько User-Agent для ротации |
 | `--no-progress` | без прогресс-бара |
 
 Приоритет настроек: **по умолчанию < файл `--config` < параметры командной строки**.
@@ -187,6 +188,7 @@ python -m crawler --help
 | `error_backoff` | `0` | замедление после 429/5xx/таймаутов, растёт вдвое с каждой ошибкой подряд |
 | `respect_robots` | `false` | соблюдать robots.txt, включая Crawl-delay |
 | `user_agent` | `null` | заголовок User-Agent; `null` — стандартный aiohttp |
+| `user_agents` | `[]` | ротация: каждый запрос берёт следующую строку по кругу; robots.txt проверяется для `user_agent`, а без него — для первой в списке |
 | `connect_timeout`, `read_timeout`, `total_timeout` | `10`, `15`, `30` | таймауты, c |
 
 **`retry`** — повторы при временных ошибках (408, 429, 5xx, таймауты, обрывы сети)
@@ -264,7 +266,7 @@ AsyncCrawler.crawl
 | Метод | Что делает |
 |---|---|
 | `AdvancedCrawler.from_config(path_or_dict_or_config)` | создать из `config.yaml`, `.json`, словаря или `CrawlerConfig` |
-| `await crawl(start_urls=None) -> dict` | обход; адреса из аргумента или конфигурации плюс sitemap. Возвращает `{url: данные}` успешных страниц |
+| `await crawl(start_urls=None) -> dict` | обход; адреса из аргумента или конфигурации плюс sitemap. Возвращает `{url: данные}` успешных страниц. Каждый вызов — новый обход со своей статистикой; хранилище общее, второй обход дописывает в него |
 | `get_stats() -> dict` | `total_pages`, `successful`, `failed`, `blocked_by_robots`, `pages_per_second`, `duration_seconds`, `status_codes`, `top_domains`, `errors_by_type`, `depth_distribution`, `timeline`, `failed_urls_detail`, `components` (очередь, лимиты, повторы, хранилище, sitemap) |
 | `export_to_json(filename)` | статистика в JSON |
 | `export_to_html_report(filename)` | HTML-отчёт: графики, таблицы, светлая и тёмная тема, без интернета |
@@ -314,7 +316,7 @@ AsyncCrawler(max_concurrent=10, max_depth=3, max_per_domain=None,
 ## Проверки и производительность
 
 ```bash
-python -m tests.check_all       # 67 проверок всех семи дней, ~30 c, интернет не нужен
+python -m tests.check_all       # 69 проверок всех семи дней, ~30 c, интернет не нужен
 python -m demos.perf_day7       # синхронно против асинхронно, 100/500/1000 страниц, память
 ```
 

@@ -39,6 +39,8 @@ crawler:
   error_backoff: 0.5          # замедление после 429/5xx/таймаутов
   respect_robots: true        # соблюдать robots.txt
   user_agent: "MyBot/1.0 (educational project; +https://github.com/DmitryAD/project-Concurrency-and-asynchrony)"
+  user_agents: []             # ротация: список строк, каждый запрос берёт следующую.
+                              # robots.txt проверяется для user_agent (или первой в списке)
   connect_timeout: 10
   read_timeout: 15
   total_timeout: 30

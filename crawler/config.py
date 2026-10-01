@@ -51,6 +51,10 @@ class CrawlerSection:
     error_backoff: float = 0.0
     respect_robots: bool = False
     user_agent: str | None = None
+    # Ротация (день 4): каждый запрос берёт следующий по кругу.
+    # Правила robots.txt проверяются для user_agent, а если он не задан —
+    # для первого в списке.
+    user_agents: list[str] = field(default_factory=list)
     connect_timeout: float = 10.0
     read_timeout: float = 15.0
     total_timeout: float = 30.0
@@ -185,6 +189,8 @@ class CrawlerConfig:
                 problems.append(f"logging.{name}: '{value}', а можно {', '.join(LOG_LEVELS)}")
         if self.logging.format not in ("text", "json"):
             problems.append("logging.format: можно text или json")
+        if any(not isinstance(ua, str) or not ua.strip() for ua in self.crawler.user_agents):
+            problems.append("crawler.user_agents: каждый элемент — непустая строка")
         for url in self.start_urls + self.sitemaps:
             if not str(url).startswith(("http://", "https://")):
                 problems.append(f"адрес должен начинаться с http:// или https://: {url}")

@@ -60,6 +60,8 @@ def build_parser() -> argparse.ArgumentParser:
     extra.add_argument("--log-level", choices=["DEBUG", "INFO", "WARNING", "ERROR"],
                        help="уровень для файла лога")
     extra.add_argument("--user-agent", metavar="СТРОКА", help="как представляться сайтам")
+    extra.add_argument("--user-agents", nargs="+", metavar="СТРОКА",
+                       help="несколько User-Agent для ротации: каждый запрос берёт следующий")
     extra.add_argument("--no-progress", action="store_true", help="не показывать прогресс-бар")
     return p
 
@@ -88,6 +90,8 @@ def config_from_args(args: argparse.Namespace) -> CrawlerConfig:
         config.filters.same_domain_only = args.same_domain
     if args.user_agent:
         config.crawler.user_agent = args.user_agent
+    if args.user_agents:
+        config.crawler.user_agents = args.user_agents
     if args.output:
         config.storage.type = storage_type_for(args.output)
         config.storage.path = args.output
